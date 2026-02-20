@@ -1,0 +1,1 @@
+timestamp,device,tag_id,seq,rx_power,fp_power,fp_rx_ratio,quality,std_noise,fp_ampl1,fp_ampl2,fp_ampl3,cir_power,rxpacc,reply_delay,flags

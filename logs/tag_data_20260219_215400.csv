@@ -1,0 +1,1 @@
+timestamp,device,anchor_id,seq,distance_m,rx_power,fp_power,fp_rx_ratio,quality,round_trip,reply_delay,nlos_suspect
