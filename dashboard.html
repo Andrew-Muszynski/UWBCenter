@@ -1,0 +1,869 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>UWB BLE Dashboard</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      font-family: "Segoe UI", system-ui, sans-serif;
+      background: #0d1117;
+      color: #e6edf3;
+      min-height: 100vh;
+    }
+
+    header {
+      background: #161b22;
+      border-bottom: 1px solid #30363d;
+      padding: 12px 24px;
+      display: flex;
+      align-items: center;
+      gap: 16px;
+    }
+    header h1 { font-size: 1.1rem; font-weight: 600; letter-spacing: 0.02em; }
+    #status-dot {
+      width: 10px; height: 10px;
+      border-radius: 50%;
+      background: #3fb950;
+      box-shadow: 0 0 6px #3fb950;
+      flex-shrink: 0;
+    }
+    #status-dot.stale { background: #f85149; box-shadow: 0 0 6px #f85149; }
+    #session-label { margin-left: auto; font-size: 0.75rem; color: #8b949e; }
+
+    main {
+      padding: 24px;
+      max-width: 1800px;
+      margin: 0 auto;
+    }
+
+    /* ── Side-by-side layout ── */
+    .content-layout {
+      display: flex;
+      gap: 24px;
+      align-items: flex-start;
+    }
+    .left-panel {
+      flex: 0 0 380px;
+      min-width: 320px;
+    }
+    .right-panel {
+      flex: 1;
+      position: sticky;
+      top: 24px;
+    }
+    @media (max-width: 900px) {
+      .content-layout { flex-direction: column; }
+      .left-panel, .right-panel { flex: none; width: 100%; position: static; }
+    }
+
+    /* ── Section headings ── */
+    .section-title {
+      font-size: 0.7rem;
+      font-weight: 600;
+      letter-spacing: 0.12em;
+      text-transform: uppercase;
+      color: #8b949e;
+      margin-bottom: 12px;
+      margin-top: 28px;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .section-title:first-child { margin-top: 0; }
+
+    /* ── Device cards ── */
+    .device-grid {
+      display: grid;
+      grid-template-columns: 1fr;
+      gap: 16px;
+    }
+    .card {
+      background: #161b22;
+      border: 1px solid #30363d;
+      border-radius: 10px;
+      padding: 18px 20px;
+      overflow: hidden;
+    }
+    .card.tag    { border-top: 3px solid #388bfd; }
+    .card.anchor { border-top: 3px solid #3fb950; }
+    .card.disconnected { opacity: 0.55; }
+
+    .card-header {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      margin-bottom: 14px;
+    }
+    .device-name { font-size: 1.15rem; font-weight: 700; }
+    .badge {
+      font-size: 0.65rem; font-weight: 600;
+      padding: 2px 8px; border-radius: 20px;
+      text-transform: uppercase; letter-spacing: 0.06em;
+    }
+    .badge.tag    { background: #1c3160; color: #79c0ff; }
+    .badge.anchor { background: #14291a; color: #56d364; }
+    .conn-dot {
+      width: 8px; height: 8px;
+      border-radius: 50%;
+      margin-left: auto; flex-shrink: 0;
+    }
+    .conn-dot.on  { background: #3fb950; box-shadow: 0 0 5px #3fb950; }
+    .conn-dot.off { background: #6e7681; }
+
+    .distance-display { text-align: center; margin: 10px 0 16px; }
+    .distance-value {
+      font-size: 2.8rem; font-weight: 700;
+      color: #79c0ff; line-height: 1;
+    }
+    .distance-unit { font-size: 1rem; color: #8b949e; margin-left: 4px; }
+    .distance-label { font-size: 0.7rem; color: #8b949e; margin-top: 2px; }
+
+    .metrics {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 8px;
+    }
+    .metric {
+      background: #0d1117;
+      border: 1px solid #21262d;
+      border-radius: 6px;
+      padding: 8px 10px;
+      text-align: center;
+    }
+    .metric-value { font-size: 1.05rem; font-weight: 600; color: #e6edf3; }
+    .metric-label { font-size: 0.65rem; color: #8b949e; margin-top: 2px; }
+    .metric-value.warn { color: #f0883e; }
+    .metric-value.good { color: #3fb950; }
+
+    .spark-wrap { margin-top: 14px; }
+    .spark-label { font-size: 0.65rem; color: #8b949e; margin-bottom: 4px; }
+    canvas.sparkline {
+      width: 100%; height: 50px;
+      display: block; border-radius: 4px;
+      background: #0d1117;
+    }
+
+    .card-footer {
+      margin-top: 12px; font-size: 0.65rem; color: #6e7681;
+      display: flex; justify-content: space-between;
+    }
+    .nlos-badge {
+      display: inline-block;
+      background: #6e2a2a; color: #f85149;
+      font-size: 0.65rem; font-weight: 700;
+      padding: 1px 7px; border-radius: 4px; margin-left: 8px;
+    }
+
+    /* ── Position map ── */
+    .map-card {
+      background: #161b22;
+      border: 1px solid #30363d;
+      border-radius: 10px;
+      padding: 18px 20px;
+    }
+    #posmap {
+      display: block;
+      width: 100%;
+      aspect-ratio: 1 / 1;
+      border-radius: 6px;
+      cursor: default;
+    }
+    .map-footer {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-top: 10px;
+      flex-wrap: wrap;
+      gap: 8px;
+    }
+    .map-legend {
+      display: flex; gap: 14px; flex-wrap: wrap;
+      font-size: 0.7rem; color: #8b949e;
+    }
+    .legend-item { display: flex; align-items: center; gap: 5px; }
+    .legend-dot { width: 10px; height: 10px; border-radius: 50%; flex-shrink: 0; }
+    .legend-diamond {
+      width: 10px; height: 10px;
+      transform: rotate(45deg);
+      border-radius: 2px; flex-shrink: 0;
+    }
+    #map-mode { font-size: 0.65rem; color: #6e7681; font-style: italic; }
+
+    /* ── Log paths ── */
+    #log-info {
+      margin-top: 28px; font-size: 0.75rem; color: #6e7681;
+      background: #161b22; border: 1px solid #30363d;
+      border-radius: 6px; padding: 12px 16px;
+    }
+    #log-info span { color: #8b949e; }
+
+    /* ── Empty state ── */
+    #empty-state { text-align: center; padding: 60px 0; color: #6e7681; }
+    #empty-state p { margin-top: 8px; font-size: 0.9rem; }
+    .pulse { animation: pulse 1.4s ease-in-out infinite; }
+    @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.4} }
+  </style>
+</head>
+<body>
+
+<header>
+  <div id="status-dot"></div>
+  <h1>UWB BLE Dashboard</h1>
+  <span id="session-label">connecting…</span>
+</header>
+
+<main>
+  <div id="empty-state">
+    <div class="pulse" style="font-size:2rem">📡</div>
+    <p>Waiting for devices…</p>
+  </div>
+
+  <div class="content-layout" id="content-layout" style="display:none">
+
+    <!-- ── Left: device cards ── -->
+    <div class="left-panel">
+      <div id="tags-section" style="display:none">
+        <div class="section-title">Tags</div>
+        <div class="device-grid" id="tags-grid"></div>
+      </div>
+      <div id="anchors-section" style="display:none">
+        <div class="section-title" style="margin-top:24px">Anchors</div>
+        <div class="device-grid" id="anchors-grid"></div>
+      </div>
+      <div id="log-info" style="display:none">
+        Tag log: <span id="tag-log-path">—</span><br>
+        Anchor log: <span id="anchor-log-path">—</span>
+      </div>
+    </div>
+
+    <!-- ── Right: position map ── -->
+    <div class="right-panel">
+      <div class="section-title">
+        Position Map
+        <span id="map-mode"></span>
+      </div>
+      <div class="map-card">
+        <canvas id="posmap" width="700" height="700"></canvas>
+        <div class="map-footer">
+          <div class="map-legend">
+            <div class="legend-item">
+              <div class="legend-diamond" style="background:#3fb950"></div>
+              <span>Anchor (fixed)</span>
+            </div>
+            <div class="legend-item">
+              <div class="legend-dot" style="background:#388bfd"></div>
+              <span>Tag</span>
+            </div>
+            <div class="legend-item">
+              <div class="legend-dot" style="background:#388bfd33; outline: 1px dashed #388bfd66; outline-offset:1px"></div>
+              <span>Distance ring</span>
+            </div>
+            <div class="legend-item">
+              <div class="legend-dot" style="background:#388bfd55"></div>
+              <span>Trail</span>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</main>
+
+<script>
+// ─────────────────────────────────────────────────────────────────────────────
+// ANCHOR POSITIONS  (metres, relative to A1 at origin)
+// Edit these to match your physical deployment.
+// With 1 anchor the tag is shown at the measured radius due East — angle unknown.
+// With 2+ anchors, position is estimated by circle-intersection / trilateration.
+// ─────────────────────────────────────────────────────────────────────────────
+const ANCHOR_POS = {
+  A1:  { x: 0,   y: 0   },
+  A2:  { x: 6,   y: 0   },
+  A3:  { x: 3,   y: 5.2 },
+  A4:  { x: 9,   y: 5.2 },
+  A5:  { x: 0,   y: 10.4 },
+  A6:  { x: 6,   y: 10.4 },
+  A7:  { x: 3,   y: 15.6 },
+  A8:  { x: 9,   y: 15.6 },
+  A9:  { x: 0,   y: 20.8 },
+  A10: { x: 6,   y: 20.8 },
+};
+
+// ── Sparklines ────────────────────────────────────────────────
+const sparkHistory = {};
+const SPARK_LEN = 60;
+
+function pushSpark(name, val) {
+  if (!sparkHistory[name]) sparkHistory[name] = [];
+  sparkHistory[name].push(val);
+  if (sparkHistory[name].length > SPARK_LEN) sparkHistory[name].shift();
+}
+
+function drawSpark(canvas, values, color) {
+  const ctx = canvas.getContext("2d");
+  const W = canvas.width, H = canvas.height;
+  ctx.clearRect(0, 0, W, H);
+  if (values.length < 2) return;
+  const min = Math.min(...values), max = Math.max(...values);
+  const range = max - min || 1;
+  ctx.beginPath();
+  values.forEach((v, i) => {
+    const x = (i / (SPARK_LEN - 1)) * W;
+    const y = H - ((v - min) / range) * (H - 4) - 2;
+    i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
+  });
+  ctx.strokeStyle = color; ctx.lineWidth = 1.5; ctx.stroke();
+  ctx.lineTo((values.length - 1) / (SPARK_LEN - 1) * W, H);
+  ctx.lineTo(0, H); ctx.closePath();
+  ctx.fillStyle = color + "28"; ctx.fill();
+}
+
+// ── Card HTML ─────────────────────────────────────────────────
+function fmt(val, dec = 1) {
+  return val == null ? "—" : Number(val).toFixed(dec);
+}
+
+function tagCard(name, d) {
+  const l = d.latest || {}, nlos = l.nlos_suspect;
+  return `
+  <div class="card tag ${d.connected ? '' : 'disconnected'}" id="card-${name}">
+    <div class="card-header">
+      <span class="device-name">${name}</span>
+      <span class="badge tag">Tag</span>
+      ${l.anchor_id != null ? `<span style="font-size:.7rem;color:#8b949e">→ A${l.anchor_id}</span>` : ''}
+      ${nlos ? `<span class="nlos-badge">NLOS?</span>` : ''}
+      <div class="conn-dot ${d.connected ? 'on' : 'off'}"></div>
+    </div>
+    <div class="distance-display">
+      <span class="distance-value">${l.distance_m != null ? fmt(l.distance_m, 3) : '—'}</span>
+      <span class="distance-unit">m</span>
+      <div class="distance-label">Distance to anchor</div>
+    </div>
+    <div class="metrics">
+      <div class="metric">
+        <div class="metric-value">${fmt(l.rx_power)} <small style="font-size:.6rem">dBm</small></div>
+        <div class="metric-label">RX Power</div>
+      </div>
+      <div class="metric">
+        <div class="metric-value">${fmt(l.fp_power)} <small style="font-size:.6rem">dBm</small></div>
+        <div class="metric-label">FP Power</div>
+      </div>
+      <div class="metric">
+        <div class="metric-value ${l.quality > 100 ? 'good' : 'warn'}">${fmt(l.quality, 1)}</div>
+        <div class="metric-label">Quality</div>
+      </div>
+      <div class="metric">
+        <div class="metric-value">${fmt(l.fp_rx_ratio)} <small style="font-size:.6rem">dB</small></div>
+        <div class="metric-label">FP–RX Ratio</div>
+      </div>
+      <div class="metric">
+        <div class="metric-value">${l.round_trip != null ? l.round_trip : '—'}</div>
+        <div class="metric-label">Round-trip</div>
+      </div>
+      <div class="metric">
+        <div class="metric-value">${d.packet_count}</div>
+        <div class="metric-label">Packets</div>
+      </div>
+    </div>
+    <div class="spark-wrap">
+      <div class="spark-label">Distance (m) — last ${SPARK_LEN} samples</div>
+      <canvas class="sparkline" id="spark-${name}" width="600" height="100"></canvas>
+    </div>
+    <div class="card-footer">
+      <span>${d.addr}</span>
+      <span>${l._ts ? l._ts.slice(11, 19) : ''}</span>
+    </div>
+  </div>`;
+}
+
+function anchorCard(name, d) {
+  const l = d.latest || {};
+  return `
+  <div class="card anchor ${d.connected ? '' : 'disconnected'}" id="card-${name}">
+    <div class="card-header">
+      <span class="device-name">${name}</span>
+      <span class="badge anchor">Anchor</span>
+      ${l.tag_id != null ? `<span style="font-size:.7rem;color:#8b949e">← T${l.tag_id}</span>` : ''}
+      <div class="conn-dot ${d.connected ? 'on' : 'off'}"></div>
+    </div>
+    <div class="metrics">
+      <div class="metric">
+        <div class="metric-value">${fmt(l.rx_power)} <small style="font-size:.6rem">dBm</small></div>
+        <div class="metric-label">RX Power</div>
+      </div>
+      <div class="metric">
+        <div class="metric-value">${fmt(l.fp_power)} <small style="font-size:.6rem">dBm</small></div>
+        <div class="metric-label">FP Power</div>
+      </div>
+      <div class="metric">
+        <div class="metric-value ${l.quality > 100 ? 'good' : 'warn'}">${fmt(l.quality, 1)}</div>
+        <div class="metric-label">Quality</div>
+      </div>
+      <div class="metric">
+        <div class="metric-value">${fmt(l.fp_rx_ratio)} <small style="font-size:.6rem">dB</small></div>
+        <div class="metric-label">FP–RX Ratio</div>
+      </div>
+      <div class="metric">
+        <div class="metric-value">${l.reply_delay != null ? l.reply_delay : '—'}</div>
+        <div class="metric-label">Reply Delay</div>
+      </div>
+      <div class="metric">
+        <div class="metric-value">${d.packet_count}</div>
+        <div class="metric-label">Packets</div>
+      </div>
+    </div>
+    <div class="spark-wrap">
+      <div class="spark-label">RX Power (dBm) — last ${SPARK_LEN} samples</div>
+      <canvas class="sparkline" id="spark-${name}" width="600" height="100"></canvas>
+    </div>
+    <div class="card-footer">
+      <span>${d.addr}</span>
+      <span>${l._ts ? l._ts.slice(11, 19) : ''}</span>
+    </div>
+  </div>`;
+}
+
+// ── Position estimation ───────────────────────────────────────
+
+// Scan the tag's history to find the most recent distance to each anchor.
+function getTagDists(tagData) {
+  const dists = {};
+  const hist = tagData.history || [];
+  for (let i = hist.length - 1; i >= 0; i--) {
+    const p = hist[i];
+    if (p.anchor_id != null && dists[p.anchor_id] === undefined && p.distance_m > 0) {
+      dists[p.anchor_id] = p.distance_m;
+    }
+  }
+  return dists; // { anchor_id_int → distance_m }
+}
+
+// Circle–circle intersection. Returns ONE of the two intersection points,
+// or the nearest feasible point when circles don't overlap.
+function circleIntersect(p1, r1, p2, r2) {
+  const dx = p2.x - p1.x, dy = p2.y - p1.y;
+  const d = Math.hypot(dx, dy);
+  if (d < 1e-6) return { x: p1.x + r1, y: p1.y };
+  // Clamp radii so they always touch
+  const R1 = Math.min(r1, d + r2 - 1e-4);
+  const R2 = Math.min(r2, d + R1 - 1e-4);
+  const a = (R1 * R1 - R2 * R2 + d * d) / (2 * d);
+  const h = Math.sqrt(Math.max(0, R1 * R1 - a * a));
+  const mx = p1.x + a * dx / d;
+  const my = p1.y + a * dy / d;
+  // Choose the intersection with the larger y (consistent arbitrary choice)
+  return { x: mx + h * dy / d, y: my - h * dx / d };
+}
+
+// Gradient-descent trilateration for 3+ anchors.
+function trilaterate(circles) {
+  let x = circles.reduce((s, c) => s + c.pos.x, 0) / circles.length;
+  let y = circles.reduce((s, c) => s + c.pos.y, 0) / circles.length;
+  let lr = 0.05;
+  for (let i = 0; i < 300; i++) {
+    let gx = 0, gy = 0;
+    for (const c of circles) {
+      const dx = x - c.pos.x, dy = y - c.pos.y;
+      const d = Math.hypot(dx, dy) || 1e-4;
+      const err = d - c.r;
+      gx += err * dx / d;
+      gy += err * dy / d;
+    }
+    x -= lr * gx / circles.length;
+    y -= lr * gy / circles.length;
+    lr *= 0.993;
+  }
+  return { x, y };
+}
+
+// Returns { x, y, anchors } or null.
+function estimatePos(tagData) {
+  const dists = getTagDists(tagData);
+  const circles = Object.entries(dists)
+    .map(([id, r]) => ({ pos: ANCHOR_POS["A" + id], r }))
+    .filter(c => c.pos != null && c.r > 0);
+
+  if (circles.length === 0) return null;
+
+  if (circles.length === 1) {
+    // Unknown angle: place tag due East of the anchor
+    return { x: circles[0].pos.x + circles[0].r, y: circles[0].pos.y, anchors: 1 };
+  }
+  if (circles.length === 2) {
+    const p = circleIntersect(circles[0].pos, circles[0].r, circles[1].pos, circles[1].r);
+    return { ...p, anchors: 2 };
+  }
+  const p = trilaterate(circles);
+  return { ...p, anchors: circles.length };
+}
+
+// ── Tag trail ─────────────────────────────────────────────────
+const tagTrail = {};  // name → [{x, y}]
+const TRAIL_LEN = 60;
+
+function pushTrail(name, pos) {
+  if (!tagTrail[name]) tagTrail[name] = [];
+  const trail = tagTrail[name];
+  // Only push if moved more than 1 cm to avoid identical stacking
+  const last = trail[trail.length - 1];
+  if (last && Math.hypot(pos.x - last.x, pos.y - last.y) < 0.01) return;
+  trail.push({ x: pos.x, y: pos.y });
+  if (trail.length > TRAIL_LEN) trail.shift();
+}
+
+// ── Position map drawing ──────────────────────────────────────
+
+function gridStep(scale) {
+  if (scale > 120) return 0.5;
+  if (scale > 60)  return 1;
+  if (scale > 25)  return 2;
+  if (scale > 12)  return 5;
+  return 10;
+}
+
+function drawMap(allDevices) {
+  const canvas = document.getElementById("posmap");
+  if (!canvas) return;
+  const ctx = canvas.getContext("2d");
+  const W = canvas.width, H = canvas.height;
+
+  const presentAnchors = Object.keys(allDevices)
+    .filter(n => allDevices[n].type === "anchor" && ANCHOR_POS[n]);
+  const presentTags = Object.keys(allDevices)
+    .filter(n => allDevices[n].type === "tag");
+
+  // Collect all known positions for bounding box
+  const allPts = presentAnchors.map(n => ANCHOR_POS[n]);
+  if (allPts.length === 0) allPts.push({ x: 0, y: 0 });
+
+  // Estimate tag positions and collect them too
+  const tagPos = {};
+  let maxAnchors = 0;
+  for (const tn of presentTags) {
+    const pos = estimatePos(allDevices[tn]);
+    if (pos) {
+      tagPos[tn] = pos;
+      allPts.push(pos);
+      maxAnchors = Math.max(maxAnchors, pos.anchors);
+    }
+  }
+
+  // Include trail points
+  for (const trail of Object.values(tagTrail)) {
+    for (const p of trail) allPts.push(p);
+  }
+
+  // Bounding box with padding
+  let minX = Math.min(...allPts.map(p => p.x));
+  let maxX = Math.max(...allPts.map(p => p.x));
+  let minY = Math.min(...allPts.map(p => p.y));
+  let maxY = Math.max(...allPts.map(p => p.y));
+
+  // Extra padding: include distance rings for single-anchor mode
+  const maxDist = Math.max(1, ...presentTags.flatMap(tn => {
+    const d = getTagDists(allDevices[tn]);
+    return Object.values(d);
+  }));
+  if (presentAnchors.length <= 1) {
+    minX -= maxDist + 0.5; maxX += maxDist + 0.5;
+    minY -= maxDist + 0.5; maxY += maxDist + 0.5;
+  } else {
+    minX -= 1; maxX += 1; minY -= 1; maxY += 1;
+  }
+
+  const margin = 44;
+  const scaleX = (W - 2 * margin) / (maxX - minX || 1);
+  const scaleY = (H - 2 * margin) / (maxY - minY || 1);
+  const scale  = Math.min(scaleX, scaleY);
+
+  // Centre the drawing inside the margin
+  const drawW = (maxX - minX) * scale;
+  const drawH = (maxY - minY) * scale;
+  const ox = margin + ((W - 2 * margin) - drawW) / 2;
+  const oy = margin + ((H - 2 * margin) - drawH) / 2;
+
+  // Physical → canvas transforms (Y axis flipped: positive Y = up on screen)
+  function tx(x) { return ox + (x - minX) * scale; }
+  function ty(y) { return H - (oy + (y - minY) * scale); }
+
+  // ── Clear ──
+  ctx.fillStyle = "#0d1117";
+  ctx.fillRect(0, 0, W, H);
+
+  // ── Grid ──
+  const gs = gridStep(scale);
+  const gx0 = Math.floor(minX / gs) * gs;
+  const gy0 = Math.floor(minY / gs) * gs;
+
+  ctx.strokeStyle = "#1c2128";
+  ctx.lineWidth = 1;
+  ctx.setLineDash([]);
+  for (let gx = gx0; gx <= maxX + gs; gx += gs) {
+    ctx.beginPath(); ctx.moveTo(tx(gx), 0); ctx.lineTo(tx(gx), H); ctx.stroke();
+  }
+  for (let gy = gy0; gy <= maxY + gs; gy += gs) {
+    ctx.beginPath(); ctx.moveTo(0, ty(gy)); ctx.lineTo(W, ty(gy)); ctx.stroke();
+  }
+
+  // Grid labels
+  ctx.fillStyle = "#3d444d";
+  ctx.font = "10px monospace";
+  for (let gx = gx0; gx <= maxX + gs; gx += gs) {
+    const sx = tx(gx);
+    if (sx < 4 || sx > W - 4) continue;
+    ctx.textAlign = "center";
+    ctx.fillText(gx + "m", sx, H - 4);
+  }
+  for (let gy = gy0; gy <= maxY + gs; gy += gs) {
+    const sy = ty(gy);
+    if (sy < 14 || sy > H - 14) continue;
+    ctx.textAlign = "left";
+    ctx.fillText(gy + "m", 4, sy - 3);
+  }
+
+  // ── Distance rings ──
+  for (const tn of presentTags) {
+    const dists = getTagDists(allDevices[tn]);
+    for (const [id, r] of Object.entries(dists)) {
+      const apos = ANCHOR_POS["A" + id];
+      if (!apos) continue;
+      const rPx = r * scale;
+      ctx.beginPath();
+      ctx.arc(tx(apos.x), ty(apos.y), rPx, 0, Math.PI * 2);
+      ctx.strokeStyle = "#388bfd40";
+      ctx.lineWidth = 1.5;
+      ctx.setLineDash([6, 5]);
+      ctx.stroke();
+      ctx.setLineDash([]);
+
+      // Label at the NE point of the ring
+      const angle = -Math.PI / 4;
+      const lx = tx(apos.x) + rPx * Math.cos(angle);
+      const ly = ty(apos.y) + rPx * Math.sin(angle);
+      ctx.fillStyle = "#388bfd80";
+      ctx.font = "11px 'Segoe UI', sans-serif";
+      ctx.textAlign = "left";
+      ctx.fillText(r.toFixed(2) + " m", lx + 3, ly - 3);
+    }
+  }
+
+  // ── Tag trail ──
+  for (const tn of presentTags) {
+    const trail = tagTrail[tn] || [];
+    if (trail.length < 2) continue;
+    for (let i = 1; i < trail.length; i++) {
+      const alpha = i / trail.length;
+      ctx.beginPath();
+      ctx.moveTo(tx(trail[i - 1].x), ty(trail[i - 1].y));
+      ctx.lineTo(tx(trail[i].x),     ty(trail[i].y));
+      ctx.strokeStyle = `rgba(56,139,253,${alpha * 0.45})`;
+      ctx.lineWidth = 2;
+      ctx.stroke();
+    }
+    // Fading dots along trail
+    for (let i = 0; i < trail.length - 1; i++) {
+      const alpha = (i / trail.length) * 0.5;
+      ctx.beginPath();
+      ctx.arc(tx(trail[i].x), ty(trail[i].y), 2.5, 0, Math.PI * 2);
+      ctx.fillStyle = `rgba(56,139,253,${alpha})`;
+      ctx.fill();
+    }
+  }
+
+  // ── Thin line from tag to each ranging anchor ──
+  for (const tn of presentTags) {
+    const pos = tagPos[tn];
+    if (!pos) continue;
+    const dists = getTagDists(allDevices[tn]);
+    for (const id of Object.keys(dists)) {
+      const apos = ANCHOR_POS["A" + id];
+      if (!apos) continue;
+      ctx.beginPath();
+      ctx.moveTo(tx(pos.x), ty(pos.y));
+      ctx.lineTo(tx(apos.x), ty(apos.y));
+      ctx.strokeStyle = "#388bfd1a";
+      ctx.lineWidth = 1;
+      ctx.setLineDash([3, 5]);
+      ctx.stroke();
+      ctx.setLineDash([]);
+    }
+  }
+
+  // ── Anchors (diamonds) ──
+  for (const an of presentAnchors) {
+    const apos = ANCHOR_POS[an];
+    const connected = allDevices[an]?.connected;
+    const sx = tx(apos.x), sy = ty(apos.y);
+    const sz = 11;
+
+    // Glow
+    if (connected) {
+      const g = ctx.createRadialGradient(sx, sy, 2, sx, sy, 22);
+      g.addColorStop(0, "#3fb95030"); g.addColorStop(1, "#3fb95000");
+      ctx.beginPath(); ctx.arc(sx, sy, 22, 0, Math.PI * 2);
+      ctx.fillStyle = g; ctx.fill();
+    }
+
+    // Diamond body
+    ctx.beginPath();
+    ctx.moveTo(sx,       sy - sz);
+    ctx.lineTo(sx + sz,  sy);
+    ctx.lineTo(sx,       sy + sz);
+    ctx.lineTo(sx - sz,  sy);
+    ctx.closePath();
+    ctx.fillStyle   = connected ? "#1a3a22" : "#1c2128";
+    ctx.strokeStyle = connected ? "#3fb950" : "#6e7681";
+    ctx.lineWidth = 2;
+    ctx.fill(); ctx.stroke();
+
+    // Label above
+    ctx.fillStyle = "#e6edf3";
+    ctx.font = "bold 12px 'Segoe UI', sans-serif";
+    ctx.textAlign = "center";
+    ctx.fillText(an, sx, sy - sz - 6);
+  }
+
+  // ── Tags (circles) ──
+  for (const tn of presentTags) {
+    const pos = tagPos[tn];
+    if (!pos) continue;
+    const connected = allDevices[tn]?.connected;
+    const sx = tx(pos.x), sy = ty(pos.y);
+    const r = 9;
+
+    // Outer glow
+    const g = ctx.createRadialGradient(sx, sy, r, sx, sy, r + 18);
+    g.addColorStop(0, connected ? "#388bfd50" : "#6e768150");
+    g.addColorStop(1, "#00000000");
+    ctx.beginPath(); ctx.arc(sx, sy, r + 18, 0, Math.PI * 2);
+    ctx.fillStyle = g; ctx.fill();
+
+    // Dot
+    ctx.beginPath(); ctx.arc(sx, sy, r, 0, Math.PI * 2);
+    ctx.fillStyle   = connected ? "#388bfd" : "#6e7681";
+    ctx.strokeStyle = connected ? "#79c0ff" : "#8b949e";
+    ctx.lineWidth = 2;
+    ctx.fill(); ctx.stroke();
+
+    // Name label
+    ctx.fillStyle = "#e6edf3";
+    ctx.font = "bold 12px 'Segoe UI', sans-serif";
+    ctx.textAlign = "center";
+    ctx.fillText(tn, sx, sy - r - 6);
+
+    // Distance label below dot
+    const d = allDevices[tn].latest?.distance_m;
+    if (d != null) {
+      ctx.fillStyle = "#79c0ff";
+      ctx.font = "11px 'Segoe UI', sans-serif";
+      ctx.fillText(d.toFixed(2) + " m", sx, sy + r + 14);
+    }
+
+    // Single-anchor indicator
+    if (pos.anchors === 1) {
+      ctx.fillStyle = "#6e7681";
+      ctx.font = "10px 'Segoe UI', sans-serif";
+      ctx.fillText("(angle unknown)", sx, sy + r + 26);
+    }
+  }
+
+  // ── Scale bar ──
+  const barM  = gs;
+  const barPx = barM * scale;
+  const barX  = margin;
+  const barY  = H - 14;
+  ctx.beginPath();
+  ctx.moveTo(barX, barY); ctx.lineTo(barX + barPx, barY);
+  ctx.strokeStyle = "#6e7681"; ctx.lineWidth = 2;
+  ctx.setLineDash([]); ctx.stroke();
+  // End ticks
+  [[barX, barY], [barX + barPx, barY]].forEach(([x, y]) => {
+    ctx.beginPath(); ctx.moveTo(x, y - 4); ctx.lineTo(x, y + 4);
+    ctx.stroke();
+  });
+  ctx.fillStyle = "#8b949e";
+  ctx.font = "10px monospace";
+  ctx.textAlign = "center";
+  ctx.fillText(barM + " m", barX + barPx / 2, barY - 6);
+
+  // ── Mode label ──
+  const modeEl = document.getElementById("map-mode");
+  if (modeEl) {
+    if (maxAnchors === 0)       modeEl.textContent = "";
+    else if (maxAnchors === 1)  modeEl.textContent = "— 1 anchor (radial only, angle unknown)";
+    else if (maxAnchors === 2)  modeEl.textContent = "— 2 anchors (circle intersection)";
+    else                        modeEl.textContent = `— ${maxAnchors} anchors (trilaterated)`;
+  }
+}
+
+// ── Poll loop ─────────────────────────────────────────────────
+async function poll() {
+  try {
+    const resp = await fetch("/api/state");
+    if (!resp.ok) throw new Error(resp.status);
+    const data = await resp.json();
+
+    document.getElementById("status-dot").classList.remove("stale");
+    document.getElementById("session-label").textContent = "Session: " + data.session_start;
+
+    if (data.tag_log) {
+      document.getElementById("log-info").style.display = "block";
+      document.getElementById("tag-log-path").textContent    = data.tag_log;
+      document.getElementById("anchor-log-path").textContent = data.anchor_log;
+    }
+
+    const devices = data.devices || {};
+    const names   = Object.keys(devices).sort();
+    const tags    = names.filter(n => devices[n].type === "tag");
+    const anchors = names.filter(n => devices[n].type === "anchor");
+
+    const hasDevices = names.length > 0;
+    document.getElementById("empty-state").style.display        = hasDevices ? "none" : "block";
+    document.getElementById("content-layout").style.display     = hasDevices ? "flex"  : "none";
+    document.getElementById("tags-section").style.display       = tags.length    ? "" : "none";
+    document.getElementById("anchors-section").style.display    = anchors.length ? "" : "none";
+
+    // Rebuild cards
+    document.getElementById("tags-grid").innerHTML =
+      tags.map(n => tagCard(n, devices[n])).join("");
+    document.getElementById("anchors-grid").innerHTML =
+      anchors.map(n => anchorCard(n, devices[n])).join("");
+
+    // Sparklines
+    tags.forEach(n => {
+      const l = devices[n].latest;
+      if (l && l.distance_m != null) {
+        pushSpark(n, l.distance_m);
+        const c = document.getElementById("spark-" + n);
+        if (c) drawSpark(c, sparkHistory[n], "#388bfd");
+      }
+    });
+    anchors.forEach(n => {
+      const l = devices[n].latest;
+      if (l && l.rx_power != null) {
+        pushSpark(n, l.rx_power);
+        const c = document.getElementById("spark-" + n);
+        if (c) drawSpark(c, sparkHistory[n], "#3fb950");
+      }
+    });
+
+    // Update trails then draw map
+    tags.forEach(n => {
+      const pos = estimatePos(devices[n]);
+      if (pos) pushTrail(n, pos);
+    });
+    drawMap(devices);
+
+  } catch (e) {
+    document.getElementById("status-dot").classList.add("stale");
+  }
+}
+
+poll();
+setInterval(poll, 1000);
+</script>
+</body>
+</html>
