@@ -33,11 +33,18 @@ import numpy as np
 import pandas as pd
 from datetime import datetime
 
-from sklearn.model_selection import train_test_split, cross_val_score
+from sklearn.model_selection import (
+    train_test_split, cross_val_score, LeaveOneGroupOut, GroupKFold,
+)
 from sklearn.preprocessing import PolynomialFeatures, StandardScaler
 from sklearn.linear_model import LinearRegression, Ridge
-from sklearn.ensemble import GradientBoostingRegressor, RandomForestRegressor
-from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+from sklearn.ensemble import (
+    GradientBoostingRegressor, RandomForestRegressor, RandomForestClassifier,
+)
+from sklearn.metrics import (
+    mean_absolute_error, mean_squared_error, r2_score,
+    accuracy_score, classification_report,
+)
 from sklearn.pipeline import Pipeline
 import pickle
 
@@ -60,17 +67,70 @@ ML_FEATURE_DEFS = {
     "rx_power_dBm":      "Received signal power (dBm)",
     "fp_power_dBm":      "First-path power (dBm)",
     "quality":           "Signal quality index",
-    "power_diff_dB":     "rx_power - fp_power (engineered)",
+    "power_diff_dB":     "rx_power - fp_power (multipath indicator)",
     "temp_C":            "Temperature (C)",
     "pressure_hPa":      "Barometric pressure (hPa)",
     "round_trip_ticks":  "Round-trip ticks",
     "reply_delay_ticks": "Reply delay ticks",
+    "channel_condition":  "NLOS class (0=LOS, 1=marginal, 2=NLOS)",
+    "confidence":        "Measurement confidence (0 to 1)",
 }
 
 DEFAULT_FEATURES = [
     "distance_m", "tof_ticks", "rx_power_dBm",
-    "fp_power_dBm", "quality", "power_diff_dB"
+    "fp_power_dBm", "quality", "power_diff_dB",
+    "channel_condition", "confidence",
 ]
+
+# ── NLOS classification thresholds (DW1000 User Manual Section 4.7) ───
+# power_diff_dB = rx_power_dBm - fp_power_dBm
+#   < 6 dB  => LOS (first path carries most energy)
+#   6-10 dB => Marginal (some multipath)
+#   > 10 dB => NLOS (heavy multipath / obstruction)
+NLOS_THRESH_LOS      = 6.0   # below this = LOS
+NLOS_THRESH_NLOS     = 10.0  # above this = NLOS
+
+
+def classify_channel(power_diff_dB):
+    """Classify channel condition from rx_power - fp_power difference.
+    Returns: 0 = LOS, 1 = Marginal, 2 = NLOS"""
+    if hasattr(power_diff_dB, '__iter__'):
+        return np.where(
+            power_diff_dB < NLOS_THRESH_LOS, 0,
+            np.where(power_diff_dB > NLOS_THRESH_NLOS, 2, 1)
+        ).astype(float)
+    if power_diff_dB < NLOS_THRESH_LOS:
+        return 0.0
+    elif power_diff_dB > NLOS_THRESH_NLOS:
+        return 2.0
+    return 1.0
+
+
+def compute_confidence(quality, power_diff_dB, distance_std=None):
+    """Compute a 0-1 confidence score for a measurement.
+
+    Combines:
+      - quality: higher is better (normalized via sigmoid)
+      - power_diff_dB: lower is better (LOS has small diff)
+      - distance_std: rolling std, lower is better (optional)
+    """
+    # Quality component: sigmoid centered around typical quality value
+    q = np.clip(quality, 0, 1000)
+    q_score = 1.0 / (1.0 + np.exp(-(q - 150) / 50))
+
+    # Power diff component: LOS (< 6 dB) gets high score
+    pd = np.clip(power_diff_dB, 0, 30)
+    pd_score = np.clip(1.0 - pd / 20.0, 0, 1)
+
+    # Combine (weighted)
+    conf = 0.6 * q_score + 0.4 * pd_score
+
+    # Optional: penalize high-variance measurements
+    if distance_std is not None:
+        std_penalty = np.clip(1.0 - distance_std / 0.5, 0, 1)
+        conf = conf * 0.7 + std_penalty * 0.3
+
+    return np.clip(conf, 0, 1)
 
 
 class UWBCalibrationApp:
@@ -99,6 +159,7 @@ class UWBCalibrationApp:
         self.model = None
         self.model_features = []
         self.model_info = {}
+        self.nlos_model = None
 
         # ── Live correction ──
         self.live_correcting = False
@@ -317,6 +378,15 @@ class UWBCalibrationApp:
         ttk.Label(r1, text="Test Split:").pack(side=tk.LEFT, padx=(0,5))
         self.split_var = tk.StringVar(value="0.2")
         ttk.Entry(r1, textvariable=self.split_var, width=6).pack(side=tk.LEFT)
+
+        # Pipeline options row
+        r1b = ttk.Frame(cfg); r1b.pack(fill=tk.X, pady=3)
+        self.multistage_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(r1b, text="Multi-stage pipeline (NLOS classifier + regressor)",
+                        variable=self.multistage_var).pack(side=tk.LEFT, padx=(0,20))
+        self.lodo_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(r1b, text="LODO cross-validation (leave-one-distance-out)",
+                        variable=self.lodo_var).pack(side=tk.LEFT)
 
         # Feature checkboxes
         ff = ttk.LabelFrame(cfg, text="Feature Selection", padding=8)
@@ -557,6 +627,10 @@ class UWBCalibrationApp:
             parsed["timestamp"] = datetime.now().isoformat()
             parsed["power_diff_dB"] = (parsed["rx_power_dBm"]
                                        - parsed["fp_power_dBm"])
+            parsed["channel_condition"] = classify_channel(
+                parsed["power_diff_dB"])
+            parsed["confidence"] = compute_confidence(
+                parsed["quality"], parsed["power_diff_dB"])
             parsed["error_m"] = parsed["distance_m"] - true_d
 
             self.session_buffer.append(parsed)
@@ -787,6 +861,10 @@ class UWBCalibrationApp:
                     parsed["notes"] = os.path.basename(filepath)
                     parsed["power_diff_dB"] = (parsed["rx_power_dBm"]
                                                - parsed["fp_power_dBm"])
+                    parsed["channel_condition"] = classify_channel(
+                        parsed["power_diff_dB"])
+                    parsed["confidence"] = compute_confidence(
+                        parsed["quality"], parsed["power_diff_dB"])
                     parsed["error_m"] = (parsed["distance_m"] - known_dist)
                     records.append(parsed)
 
@@ -815,6 +893,10 @@ class UWBCalibrationApp:
                         r["notes"] = os.path.basename(filepath)
                         r["power_diff_dB"] = (r["rx_power_dBm"]
                                               - r["fp_power_dBm"])
+                        r["channel_condition"] = classify_channel(
+                            r["power_diff_dB"])
+                        r["confidence"] = compute_confidence(
+                            r["quality"], r["power_diff_dB"])
                         r["error_m"] = r["distance_m"] - dist
                     records = temp_records
 
@@ -850,10 +932,26 @@ class UWBCalibrationApp:
         df = df.copy()
         if "power_diff_dB" in features and "power_diff_dB" not in df.columns:
             df["power_diff_dB"] = df["rx_power_dBm"] - df["fp_power_dBm"]
+        if "channel_condition" in features and "channel_condition" not in df.columns:
+            if "power_diff_dB" not in df.columns:
+                df["power_diff_dB"] = df["rx_power_dBm"] - df["fp_power_dBm"]
+            df["channel_condition"] = classify_channel(df["power_diff_dB"].values)
+        if "confidence" in features and "confidence" not in df.columns:
+            if "power_diff_dB" not in df.columns:
+                df["power_diff_dB"] = df["rx_power_dBm"] - df["fp_power_dBm"]
+            df["confidence"] = compute_confidence(
+                df["quality"].values, df["power_diff_dB"].values)
         missing = [f for f in features if f not in df.columns]
         if missing:
             raise ValueError(f"Missing columns: {missing}")
-        return df[features].values
+        X = df[features].values.astype(float)
+        # Replace non-finite values with column medians
+        for col_i in range(X.shape[1]):
+            bad = ~np.isfinite(X[:, col_i])
+            if bad.any():
+                med = np.nanmedian(X[~bad, col_i]) if (~bad).any() else 0.0
+                X[bad, col_i] = med
+        return X
 
     def _train_model(self):
         if self.dataset.empty or len(self.dataset) < 10:
@@ -867,8 +965,14 @@ class UWBCalibrationApp:
             messagebox.showwarning("No Features", "Select at least one.")
             return
 
+        # Ensure engineered columns exist
         if "power_diff_dB" not in df.columns:
             df["power_diff_dB"] = df["rx_power_dBm"] - df["fp_power_dBm"]
+        if "channel_condition" not in df.columns:
+            df["channel_condition"] = classify_channel(df["power_diff_dB"].values)
+        if "confidence" not in df.columns:
+            df["confidence"] = compute_confidence(
+                df["quality"].values, df["power_diff_dB"].values)
 
         try:
             X = self._build_X(df, features)
@@ -880,11 +984,14 @@ class UWBCalibrationApp:
         split = float(self.split_var.get())
         algo = self.algo_var.get()
         pdeg = int(self.poly_var.get())
+        use_multistage = self.multistage_var.get()
+        use_lodo = self.lodo_var.get()
 
+        # ── Train/test split ──
         X_tr, X_te, y_tr, y_te = train_test_split(
             X, y, test_size=split, random_state=42)
 
-        # Build pipeline
+        # Build distance correction pipeline
         if algo == "polynomial_regression":
             model = Pipeline([
                 ("poly", PolynomialFeatures(degree=pdeg, include_bias=False)),
@@ -925,36 +1032,132 @@ class UWBCalibrationApp:
         cor_rmse = np.sqrt(mean_squared_error(y_te, y_pred_te))
         r2 = r2_score(y_te, y_pred_te)
 
-        cv_k = min(5, max(2, len(X) // 10))
-        cv = cross_val_score(model, X, y, cv=cv_k,
-                             scoring='neg_mean_absolute_error')
+        # ── Cross-validation ──
+        if use_lodo and "true_distance_m" in df.columns:
+            groups = df["true_distance_m"].values
+            n_groups = len(np.unique(groups))
+            if n_groups >= 2:
+                logo = LeaveOneGroupOut()
+                cv_scores = cross_val_score(
+                    model, X, y, groups=groups, cv=logo,
+                    scoring='neg_mean_absolute_error')
+                cv_label = f"LODO ({n_groups} distances)"
+            else:
+                cv_k = min(5, max(2, len(X) // 10))
+                cv_scores = cross_val_score(model, X, y, cv=cv_k,
+                                            scoring='neg_mean_absolute_error')
+                cv_label = f"{cv_k}-fold (only 1 distance, LODO not possible)"
+        else:
+            cv_k = min(5, max(2, len(X) // 10))
+            cv_scores = cross_val_score(model, X, y, cv=cv_k,
+                                        scoring='neg_mean_absolute_error')
+            cv_label = f"{cv_k}-fold"
+
+        # ── NLOS classification stage (Stage 1) ──
+        nlos_txt = ""
+        nlos_model = None
+        if use_multistage and "power_diff_dB" in df.columns:
+            ch_labels = classify_channel(df["power_diff_dB"].values).astype(int)
+            n_classes = len(np.unique(ch_labels))
+            ch_names = {0: "LOS", 1: "Marginal", 2: "NLOS"}
+
+            # Distribution summary
+            nlos_txt = "\n--- STAGE 1: CHANNEL CLASSIFICATION ---\n"
+            nlos_txt += "  Threshold-based classification (DW1000 manual Sec 4.7):\n"
+            for c in sorted(np.unique(ch_labels)):
+                count = (ch_labels == c).sum()
+                pct = count / len(ch_labels) * 100
+                nlos_txt += f"    {ch_names.get(c, '?'):<12} (class {c}): "
+                nlos_txt += f"{count:>5} samples ({pct:.1f}%)\n"
+
+            # Train a classifier if we have mixed conditions
+            if n_classes >= 2:
+                nlos_feats = ["rx_power_dBm", "fp_power_dBm", "quality",
+                              "power_diff_dB"]
+                nlos_feats = [f for f in nlos_feats if f in df.columns]
+                if nlos_feats:
+                    X_nlos = self._build_X(df, nlos_feats)
+                    X_n_tr, X_n_te, y_n_tr, y_n_te = train_test_split(
+                        X_nlos, ch_labels, test_size=0.2, random_state=42)
+                    nlos_clf = Pipeline([
+                        ("scaler", StandardScaler()),
+                        ("clf", RandomForestClassifier(
+                            n_estimators=200, max_depth=6, random_state=42))])
+                    nlos_clf.fit(X_n_tr, y_n_tr)
+                    y_n_pred = nlos_clf.predict(X_n_te)
+                    n_acc = accuracy_score(y_n_te, y_n_pred)
+                    nlos_model = nlos_clf
+
+                    nlos_txt += f"\n  Trained RF classifier on: {', '.join(nlos_feats)}\n"
+                    nlos_txt += f"  Accuracy: {n_acc*100:.1f}%\n"
+
+                    # Per-class correction performance
+                    nlos_txt += "\n  Per-channel-condition distance error:\n"
+                    for c in sorted(np.unique(ch_labels)):
+                        mask = ch_labels == c
+                        if mask.sum() == 0:
+                            continue
+                        sX = self._build_X(df[mask], features)
+                        sy = df.loc[mask, "true_distance_m"].values
+                        sp = model.predict(sX)
+                        cm = np.mean(np.abs(sp - sy))
+                        if di is not None:
+                            sr = sX[:, di]
+                            rm = np.mean(np.abs(sr - sy))
+                            nlos_txt += (f"    {ch_names.get(c, '?'):<12}: "
+                                         f"Raw MAE={rm*100:.1f}cm -> "
+                                         f"Corrected MAE={cm*100:.1f}cm  "
+                                         f"({mask.sum()} samples)\n")
+                        else:
+                            nlos_txt += (f"    {ch_names.get(c, '?'):<12}: "
+                                         f"Corrected MAE={cm*100:.1f}cm  "
+                                         f"({mask.sum()} samples)\n")
+            else:
+                nlos_txt += f"\n  All samples are same class, "
+                nlos_txt += "classifier not trained.\n"
+
+            # Confidence distribution
+            if "confidence" in df.columns:
+                conf = df["confidence"].values
+                nlos_txt += f"\n  Confidence: mean={conf.mean():.3f}  "
+                nlos_txt += f"min={conf.min():.3f}  max={conf.max():.3f}\n"
+                low_conf = (conf < 0.3).sum()
+                if low_conf > 0:
+                    nlos_txt += (f"  Warning: {low_conf} samples ({low_conf/len(conf)*100:.1f}%) "
+                                 f"have low confidence (< 0.3)\n")
 
         # Feature importance for tree models
         imp_str = ""
         if algo in ("gradient_boosting", "random_forest"):
             imp = model.named_steps["reg"].feature_importances_
             idx = np.argsort(imp)[::-1]
-            imp_str = "\n--- FEATURE IMPORTANCE ---\n"
+            imp_str = "\n--- STAGE 2: FEATURE IMPORTANCE ---\n"
             for i in idx:
                 bar = "#" * int(imp[i] * 40)
                 imp_str += f"  {features[i]:<22} {imp[i]:.4f}  {bar}\n"
 
         self.model = model
         self.model_features = features
+        self.nlos_model = nlos_model if use_multistage else None
         improve = ((raw_mae - cor_mae) / raw_mae * 100) if raw_mae > 0 else 0
         self.model_info = {
             "algorithm": algo, "features": features,
             "raw_mae": raw_mae, "cor_mae": cor_mae,
-            "improvement": improve}
+            "improvement": improve,
+            "multistage": use_multistage,
+            "nlos_model": nlos_model,
+        }
 
         # ── Results text ──
+        pipeline_label = "MULTI-STAGE" if use_multistage else "SINGLE-STAGE"
         txt = (
             f"{'='*55}\n"
-            f"  ML MODEL TRAINING RESULTS\n"
+            f"  ML MODEL TRAINING RESULTS ({pipeline_label})\n"
             f"{'='*55}\n\n"
             f"Algorithm:  {algo}\n"
             f"Features:   {', '.join(features)}\n"
-            f"Train/Test: {len(X_tr)} / {len(X_te)}\n\n"
+            f"Train/Test: {len(X_tr)} / {len(X_te)}\n"
+            f"Pipeline:   {pipeline_label}\n\n"
             f"{'_'*40}\n"
             f"  BEFORE ML (raw vs true):\n"
             f"    MAE:  {raw_mae:.4f} m  ({raw_mae*100:.2f} cm)\n"
@@ -967,8 +1170,9 @@ class UWBCalibrationApp:
             f"    Mean bias: {cor_err.mean():+.4f} m\n\n"
             f"  IMPROVEMENT: {improve:.1f}% MAE reduction\n"
             f"{'_'*40}\n"
-            f"  Cross-Validation ({cv_k}-fold):\n"
-            f"    MAE: {-cv.mean():.4f} +/- {cv.std():.4f} m\n"
+            f"  Cross-Validation ({cv_label}):\n"
+            f"    MAE: {-cv_scores.mean():.4f} +/- {cv_scores.std():.4f} m\n"
+            f"{nlos_txt}"
             f"{imp_str}\n")
 
         # Per-distance breakdown
@@ -988,13 +1192,28 @@ class UWBCalibrationApp:
                 txt += (f"  {dist:.2f}m: Raw MAE={rm:.4f}m -> "
                         f"Corrected MAE={cm:.4f}m  ({len(sy)} samples)\n")
 
+        # LODO per-fold results
+        if use_lodo and "true_distance_m" in df.columns:
+            groups = df["true_distance_m"].values
+            n_groups = len(np.unique(groups))
+            if n_groups >= 2:
+                txt += "\n--- LODO FOLD DETAILS ---\n"
+                logo = LeaveOneGroupOut()
+                for fold_i, (tr_idx, te_idx) in enumerate(logo.split(X, y, groups)):
+                    held_dist = groups[te_idx[0]]
+                    fold_model = type(model).from_pipeline(model) if hasattr(type(model), 'from_pipeline') else None
+                    # Just report the CV score per fold
+                    txt += f"  Fold {fold_i+1}: held out {held_dist:.2f}m "
+                    txt += f"({len(te_idx)} samples)  "
+                    txt += f"MAE = {-cv_scores[fold_i]*100:.1f} cm\n"
+
         self.results_text.config(state=tk.NORMAL)
         self.results_text.delete("1.0", tk.END)
         self.results_text.insert("1.0", txt)
         self.results_text.config(state=tk.DISABLED)
 
         self.model_status.config(
-            text=f"Trained: {algo} (MAE: {cor_mae:.4f}m)",
+            text=f"Trained: {algo} (MAE: {cor_mae:.4f}m) [{pipeline_label}]",
             foreground="green")
 
         # ── Plot ──
@@ -1002,33 +1221,35 @@ class UWBCalibrationApp:
 
     def _plot_results(self, X_te, y_te, y_pred, raw_te, df, features, di):
         self.fig.clear()
-        ax1 = self.fig.add_subplot(221)
-        ax2 = self.fig.add_subplot(222)
-        ax3 = self.fig.add_subplot(223)
-        ax4 = self.fig.add_subplot(224)
+        ax1 = self.fig.add_subplot(231)
+        ax2 = self.fig.add_subplot(232)
+        ax3 = self.fig.add_subplot(233)
+        ax4 = self.fig.add_subplot(234)
+        ax5 = self.fig.add_subplot(235)
+        ax6 = self.fig.add_subplot(236)
 
         re = raw_te - y_te
         ce = y_pred - y_te
 
-        # 1 ── Raw vs Corrected scatter
+        # 1 - Raw vs Corrected scatter
         ax1.scatter(y_te, raw_te, alpha=0.3, s=10, c="red", label="Raw")
         ax1.scatter(y_te, y_pred, alpha=0.3, s=10, c="green", label="Corrected")
         lo = min(y_te.min(), raw_te.min(), y_pred.min()) - 0.3
         hi = max(y_te.max(), raw_te.max(), y_pred.max()) + 0.3
         ax1.plot([lo,hi], [lo,hi], 'k--', alpha=0.5, label="Perfect")
         ax1.set_xlabel("True (m)"); ax1.set_ylabel("Output (m)")
-        ax1.set_title("Raw vs Corrected"); ax1.legend(fontsize=7)
+        ax1.set_title("Raw vs Corrected", fontsize=9); ax1.legend(fontsize=6)
 
-        # 2 ── Error histograms
+        # 2 - Error histograms
         ax2.hist(re, bins=40, alpha=0.5, color="red",
                  label=f"Raw s={re.std():.4f}")
         ax2.hist(ce, bins=40, alpha=0.5, color="green",
                  label=f"Corr s={ce.std():.4f}")
         ax2.axvline(0, color='k', ls='--', alpha=0.5)
-        ax2.set_xlabel("Error (m)"); ax2.set_title("Error Distribution")
-        ax2.legend(fontsize=7)
+        ax2.set_xlabel("Error (m)"); ax2.set_title("Error Distribution", fontsize=9)
+        ax2.legend(fontsize=6)
 
-        # 3 ── Error vs true distance (full dataset)
+        # 3 - Error vs true distance (full dataset)
         aX = self._build_X(df, features)
         ay = df["true_distance_m"].values
         ap = self.model.predict(aX)
@@ -1040,13 +1261,59 @@ class UWBCalibrationApp:
         ax3.scatter(ay, ap-ay, alpha=0.2, s=6, c="green", label="Corrected")
         ax3.axhline(0, color='k', ls='--', alpha=0.5)
         ax3.set_xlabel("True (m)"); ax3.set_ylabel("Error (m)")
-        ax3.set_title("Error vs Distance"); ax3.legend(fontsize=7)
+        ax3.set_title("Error vs Distance", fontsize=9); ax3.legend(fontsize=6)
 
-        # 4 ── Residual plot
+        # 4 - Residual plot
         ax4.scatter(ap, ap-ay, alpha=0.2, s=6, c="green")
         ax4.axhline(0, color='k', ls='--', alpha=0.5)
         ax4.set_xlabel("Predicted (m)"); ax4.set_ylabel("Residual (m)")
-        ax4.set_title("Residual Plot")
+        ax4.set_title("Residual Plot", fontsize=9)
+
+        # 5 - Channel condition distribution
+        if "power_diff_dB" in df.columns:
+            pd_vals = df["power_diff_dB"].values
+            ch_labels = classify_channel(pd_vals)
+            colors_map = {0: "#2ecc71", 1: "#f39c12", 2: "#e74c3c"}
+            ch_names = {0: "LOS", 1: "Marginal", 2: "NLOS"}
+            for c in [0, 1, 2]:
+                mask = ch_labels == c
+                if mask.any():
+                    ax5.scatter(
+                        ay[mask], (ar-ay)[mask] if di is not None else np.zeros(mask.sum()),
+                        alpha=0.4, s=8, c=colors_map[c],
+                        label=f"{ch_names[c]} ({mask.sum()})")
+            ax5.axhline(0, color='k', ls='--', alpha=0.5)
+            ax5.axhspan(-0.1, 0.1, alpha=0.1, color='green')
+            ax5.set_xlabel("True (m)"); ax5.set_ylabel("Raw Error (m)")
+            ax5.set_title("Error by Channel Condition", fontsize=9)
+            ax5.legend(fontsize=6)
+        else:
+            ax5.text(0.5, 0.5, "No power_diff_dB data",
+                     ha='center', va='center', transform=ax5.transAxes)
+
+        # 6 - Confidence vs absolute error
+        if "confidence" in df.columns or "power_diff_dB" in df.columns:
+            if "confidence" not in df.columns:
+                conf = compute_confidence(
+                    df["quality"].values, df["power_diff_dB"].values)
+            else:
+                conf = df["confidence"].values
+            abs_err = np.abs(ap - ay)
+            ax6.scatter(conf, abs_err, alpha=0.2, s=6, c="blue")
+            # Add trend line
+            if len(conf) > 10:
+                bins = np.linspace(0, 1, 11)
+                bin_idx = np.digitize(conf, bins)
+                for b in range(1, len(bins)):
+                    mask = bin_idx == b
+                    if mask.sum() > 0:
+                        ax6.plot(bins[b-1:b+1].mean(), abs_err[mask].mean(),
+                                 'ro', ms=6, zorder=5)
+            ax6.set_xlabel("Confidence"); ax6.set_ylabel("|Error| (m)")
+            ax6.set_title("Confidence vs Error", fontsize=9)
+        else:
+            ax6.text(0.5, 0.5, "No confidence data",
+                     ha='center', va='center', transform=ax6.transAxes)
 
         self.fig.tight_layout()
         self.canvas.draw()
@@ -1061,7 +1328,8 @@ class UWBCalibrationApp:
             with open(path, 'wb') as f:
                 pickle.dump({"model": self.model,
                              "features": self.model_features,
-                             "info": self.model_info}, f)
+                             "info": self.model_info,
+                             "nlos_model": getattr(self, 'nlos_model', None)}, f)
             messagebox.showinfo("Saved", f"Model saved to {path}")
 
     def _load_model(self):
@@ -1074,8 +1342,10 @@ class UWBCalibrationApp:
                 self.model = obj["model"]
                 self.model_features = obj["features"]
                 self.model_info = obj.get("info", {})
+                self.nlos_model = obj.get("nlos_model", None)
+                ms = "MULTI-STAGE" if self.model_info.get("multistage") else "SINGLE"
                 self.model_status.config(
-                    text=f"Loaded: {self.model_info.get('algorithm','?')}",
+                    text=f"Loaded: {self.model_info.get('algorithm','?')} [{ms}]",
                     foreground="green")
             except Exception as e:
                 messagebox.showerror("Load Error", str(e))
@@ -1103,7 +1373,7 @@ class UWBCalibrationApp:
             self.live_btn.config(text="Stop Live Correction")
 
     def _update_live(self, parsed):
-        """Apply ML correction to a parsed line in real-time."""
+        """Apply multi-stage ML correction to a parsed line in real-time."""
         try:
             true_d = float(self.live_true_var.get())
         except ValueError:
@@ -1114,6 +1384,11 @@ class UWBCalibrationApp:
             p["power_diff_dB"] = p["rx_power_dBm"] - p["fp_power_dBm"]
         if "angle_deg" not in p:
             p["angle_deg"] = float(self.live_angle_var.get())
+        if "channel_condition" not in p:
+            p["channel_condition"] = classify_channel(p["power_diff_dB"])
+        if "confidence" not in p:
+            p["confidence"] = compute_confidence(
+                p["quality"], p["power_diff_dB"])
 
         try:
             fv = [p[f] for f in self.model_features]
@@ -1125,8 +1400,17 @@ class UWBCalibrationApp:
         raw_e = raw_d - true_d
         cor_e = corrected - true_d
 
+        # Channel condition label
+        ch_names = {0: "LOS", 1: "MARGINAL", 2: "NLOS"}
+        ch_colors = {0: "green", 1: "orange", 2: "red"}
+        ch = int(p["channel_condition"])
+        conf = p["confidence"]
+
         self.raw_val.config(text=f"{raw_d:.4f} m")
-        self.raw_err.config(text=f"Error: {raw_e:+.4f} m")
+        self.raw_err.config(
+            text=f"Error: {raw_e:+.4f} m  |  "
+                 f"{ch_names.get(ch, '?')}  conf={conf:.2f}",
+            foreground=ch_colors.get(ch, "gray"))
         self.cor_val.config(text=f"{corrected:.4f} m")
         self.cor_err.config(
             text=f"Error: {cor_e:+.4f} m",
