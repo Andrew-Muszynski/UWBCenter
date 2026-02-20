@@ -38,7 +38,9 @@ try:
 except ImportError:
     HAS_REQUESTS = False
 
-from sklearn.model_selection import train_test_split, cross_val_score
+from sklearn.model_selection import (
+    train_test_split, cross_val_score, LeaveOneGroupOut,
+)
 from sklearn.preprocessing import StandardScaler
 from sklearn.ensemble import (
     GradientBoostingRegressor, RandomForestRegressor, RandomForestClassifier,
@@ -73,16 +75,19 @@ RAW_FEATURES = [
 
 # Engineered features computed from the raw ones
 ENG_FEATURES = [
-    "ampl1_ratio",   # fp_ampl1 / mean(fp_ampl2, fp_ampl3)  — 1st-path dominance
-    "cir_norm",      # cir_power / rxpacc                    — normalised CIR
-    "ampl_spread",   # |fp_ampl2 - fp_ampl3|                 — multipath spread
+    "ampl1_ratio",       # fp_ampl1 / mean(fp_ampl2, fp_ampl3)  - 1st-path dominance
+    "cir_norm",          # cir_power / rxpacc                    - normalised CIR
+    "ampl_spread",       # |fp_ampl2 - fp_ampl3|                 - multipath spread
+    "channel_condition",  # 0=LOS, 1=Marginal, 2=NLOS from fp_rx_ratio thresholds
+    "confidence",        # measurement confidence 0 to 1
 ]
 
 ALL_FEATURES = RAW_FEATURES + ENG_FEATURES
 
 # Sensible defaults for each model
 DEFAULT_DIST_FEAT = [
-    "distance_m", "fp_rx_ratio", "quality", "ampl1_ratio", "cir_norm", "rx_power",
+    "distance_m", "fp_rx_ratio", "quality", "ampl1_ratio",
+    "cir_norm", "rx_power", "channel_condition", "confidence",
 ]
 DEFAULT_ANGLE_FEAT = [
     "fp_rx_ratio", "quality", "ampl1_ratio", "ampl_spread", "std_noise", "rx_power",
@@ -95,6 +100,54 @@ REQUIRED_TAG_COLS = {
     "fp_ampl3", "cir_power", "rxpacc",
 }
 
+# ── NLOS classification thresholds (DW1000 User Manual Section 4.7) ───
+# fp_rx_ratio = fp_power - rx_power (negative dB, more negative = more NLOS)
+# Equivalently, rx_power - fp_power: < 6 dB = LOS, > 10 dB = NLOS
+NLOS_THRESH_LOS  = -6.0    # fp_rx_ratio above this = LOS
+NLOS_THRESH_NLOS = -10.0   # fp_rx_ratio below this = NLOS
+
+
+def classify_channel_ble(fp_rx_ratio):
+    """Classify channel condition from fp_rx_ratio (fp_power - rx_power in dB).
+    Returns: 0 = LOS, 1 = Marginal, 2 = NLOS.
+
+    Note: fp_rx_ratio is typically negative (fp_power < rx_power).
+    More negative = more multipath energy relative to first path."""
+    if hasattr(fp_rx_ratio, '__iter__'):
+        return np.where(
+            fp_rx_ratio > NLOS_THRESH_LOS, 0,
+            np.where(fp_rx_ratio < NLOS_THRESH_NLOS, 2, 1)
+        ).astype(float)
+    if fp_rx_ratio > NLOS_THRESH_LOS:
+        return 0.0
+    elif fp_rx_ratio < NLOS_THRESH_NLOS:
+        return 2.0
+    return 1.0
+
+
+def compute_confidence_ble(quality, fp_rx_ratio, std_noise=None):
+    """Compute a 0-1 confidence score for a BLE UWB measurement.
+
+    Combines:
+      - quality: higher is better (normalized via sigmoid)
+      - fp_rx_ratio: closer to 0 is better (LOS)
+      - std_noise: lower is better (optional)
+    """
+    q = np.clip(quality, 0, 1000)
+    q_score = 1.0 / (1.0 + np.exp(-(q - 150) / 50))
+
+    # FP/RX ratio: closer to 0 dB = better (LOS)
+    fpr = np.clip(np.abs(fp_rx_ratio), 0, 30)
+    fpr_score = np.clip(1.0 - fpr / 20.0, 0, 1)
+
+    conf = 0.6 * q_score + 0.4 * fpr_score
+
+    if std_noise is not None:
+        noise_score = np.clip(1.0 - std_noise / 100.0, 0, 1)
+        conf = conf * 0.8 + noise_score * 0.2
+
+    return np.clip(conf, 0, 1)
+
 # ═══════════════════════════════ HELPERS ══════════════════════════════════════
 
 def engineer(df: pd.DataFrame) -> pd.DataFrame:
@@ -105,6 +158,14 @@ def engineer(df: pd.DataFrame) -> pd.DataFrame:
     df["cir_norm"]    = df["cir_power"] / df["rxpacc"].clip(lower=1)
     df["ampl_spread"] = (df[["fp_ampl2", "fp_ampl3"]].max(axis=1)
                          - df[["fp_ampl2", "fp_ampl3"]].min(axis=1))
+    # Channel condition classification
+    if "fp_rx_ratio" in df.columns:
+        df["channel_condition"] = classify_channel_ble(df["fp_rx_ratio"].values)
+    # Confidence scoring
+    if "quality" in df.columns and "fp_rx_ratio" in df.columns:
+        std_n = df["std_noise"].values if "std_noise" in df.columns else None
+        df["confidence"] = compute_confidence_ble(
+            df["quality"].values, df["fp_rx_ratio"].values, std_n)
     return df
 
 
@@ -479,6 +540,16 @@ class UWBBLECalApp:
             self.angle_feat_vars[f] = v
             ttk.Checkbutton(afg, text=f, variable=v
                             ).grid(row=i // 2, column=i % 2, sticky=tk.W, padx=4, pady=1)
+
+        # Pipeline options
+        po = ttk.LabelFrame(lf, text="Pipeline Options", padding=8)
+        po.pack(fill=tk.X, pady=(0, 6))
+        self.multistage_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(po, text="Multi-stage (NLOS classifier + regressor)",
+                        variable=self.multistage_var).pack(anchor=tk.W)
+        self.lodo_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(po, text="LODO cross-validation (leave-one-distance-out)",
+                        variable=self.lodo_var).pack(anchor=tk.W)
 
         # Buttons
         brow = ttk.Frame(lf); brow.pack(fill=tk.X, pady=4)
@@ -885,9 +956,59 @@ class UWBBLECalApp:
             return
 
         algo = self.dist_algo_var.get()
+        use_multistage = self.multistage_var.get()
+        use_lodo = self.lodo_var.get()
         txt  = [f"{'='*58}", "  ML TRAINING REPORT", f"{'='*58}\n"]
 
-        # ── Distance corrector ─────────────────────────────────────────────
+        # ── Stage 1: NLOS Classification ──────────────────────────────────
+        nlos_clf = None
+        if use_multistage and "fp_rx_ratio" in df.columns:
+            ch_labels = classify_channel_ble(df["fp_rx_ratio"].values).astype(int)
+            n_classes = len(np.unique(ch_labels))
+            ch_names = {0: "LOS", 1: "Marginal", 2: "NLOS"}
+
+            txt.append("STAGE 1: CHANNEL CLASSIFICATION")
+            txt.append("  DW1000 Manual Sec 4.7 thresholds:")
+            txt.append(f"    fp_rx_ratio > {NLOS_THRESH_LOS} dB  =  LOS")
+            txt.append(f"    fp_rx_ratio < {NLOS_THRESH_NLOS} dB =  NLOS")
+            txt.append("")
+
+            for c in sorted(np.unique(ch_labels)):
+                count = (ch_labels == c).sum()
+                pct = count / len(ch_labels) * 100
+                txt.append(f"    {ch_names.get(c, '?'):<12} ({count:>5}, {pct:.1f}%)")
+
+            if n_classes >= 2:
+                nlos_feats = ["rx_power", "fp_power", "fp_rx_ratio",
+                              "quality", "std_noise", "ampl1_ratio"]
+                nlos_feats = [f for f in nlos_feats if f in df.columns]
+                if nlos_feats:
+                    X_nlos = safe_build_X(df, nlos_feats)
+                    X_n_tr, X_n_te, y_n_tr, y_n_te = train_test_split(
+                        X_nlos, ch_labels, test_size=0.2, random_state=42)
+                    nlos_clf = Pipeline([
+                        ("scaler", StandardScaler()),
+                        ("clf", RandomForestClassifier(
+                            n_estimators=200, max_depth=6, random_state=42))])
+                    nlos_clf.fit(X_n_tr, y_n_tr)
+                    n_acc = accuracy_score(y_n_te, nlos_clf.predict(X_n_te))
+                    txt.append(f"\n  Trained NLOS classifier: {', '.join(nlos_feats)}")
+                    txt.append(f"  Accuracy: {n_acc*100:.1f}%")
+            txt.append("")
+
+            # Confidence summary
+            if "confidence" in df.columns:
+                conf = df["confidence"].values
+                txt.append(f"  Confidence: mean={conf.mean():.3f}  "
+                           f"min={conf.min():.3f}  max={conf.max():.3f}")
+                low = (conf < 0.3).sum()
+                if low > 0:
+                    txt.append(f"  Warning: {low} low-confidence samples (< 0.3)")
+                txt.append("")
+
+        # ── Stage 2: Distance Corrector ───────────────────────────────────
+        txt.append(f"STAGE 2: DISTANCE CORRECTOR  ({algo})")
+
         try:
             X = safe_build_X(df, dist_feats)
         except ValueError as e:
@@ -910,19 +1031,42 @@ class UWBBLECalApp:
         r2       = float(r2_score(y_te, y_pred))
         improv   = (raw_mae - cor_mae) / raw_mae * 100 if raw_mae > 0 else 0
 
-        cv_k = min(5, max(2, len(X) // 10))
-        cv   = cross_val_score(pipeline, X, y, cv=cv_k,
-                               scoring="neg_mean_absolute_error")
+        # Cross-validation: LODO or standard k-fold
+        if use_lodo and "true_dist_m" in df.columns:
+            groups = df["true_dist_m"].values
+            n_groups = len(np.unique(groups))
+            if n_groups >= 2:
+                logo = LeaveOneGroupOut()
+                cv_scores = cross_val_score(
+                    pipeline, X, y, groups=groups, cv=logo,
+                    scoring="neg_mean_absolute_error")
+                cv_label = f"LODO ({n_groups} distances)"
+
+                # Per-fold detail
+                txt.append(f"\n  LODO fold results:")
+                for fold_i, dist_val in enumerate(sorted(np.unique(groups))):
+                    if fold_i < len(cv_scores):
+                        txt.append(f"    Held out {dist_val:.2f}m: "
+                                   f"MAE = {-cv_scores[fold_i]*100:.1f} cm")
+            else:
+                cv_k = min(5, max(2, len(X) // 10))
+                cv_scores = cross_val_score(pipeline, X, y, cv=cv_k,
+                                            scoring="neg_mean_absolute_error")
+                cv_label = f"{cv_k}-fold (only 1 distance)"
+        else:
+            cv_k = min(5, max(2, len(X) // 10))
+            cv_scores = cross_val_score(pipeline, X, y, cv=cv_k,
+                                        scoring="neg_mean_absolute_error")
+            cv_label = f"{cv_k}-fold"
 
         txt += [
-            f"DISTANCE CORRECTOR  ({algo})",
             f"  Features : {', '.join(dist_feats)}",
             f"  Samples  : {len(X_tr)} train / {len(X_te)} test\n",
             f"  Raw  MAE : {raw_mae*100:6.2f} cm",
-            f"  Corr MAE : {cor_mae*100:6.2f} cm   (↑ {improv:.1f}% improvement)",
+            f"  Corr MAE : {cor_mae*100:6.2f} cm   (improvement: {improv:.1f}%)",
             f"  Corr RMSE: {cor_rmse*100:6.2f} cm",
-            f"  R²       : {r2:.5f}",
-            f"  CV MAE   : {-cv.mean()*100:.2f} ± {cv.std()*100:.2f} cm  ({cv_k}-fold)\n",
+            f"  R2       : {r2:.5f}",
+            f"  CV MAE   : {-cv_scores.mean()*100:.2f} +/- {cv_scores.std()*100:.2f} cm  ({cv_label})\n",
         ]
 
         # Per-distance breakdown
@@ -997,6 +1141,8 @@ class UWBBLECalApp:
             "dist_mae_cm":  cor_mae * 100,
             "angle_feats":  angle_feats if self.angle_model else [],
             "angle_acc":    acc,
+            "multistage":   use_multistage,
+            "nlos_model":   nlos_clf,
         }
 
         # ── Update result text ────────────────────────────────────────────
@@ -1008,6 +1154,8 @@ class UWBBLECalApp:
         status = f"Dist MAE {cor_mae*100:.1f} cm"
         if acc is not None:
             status += f"   |   Angle acc {acc*100:.0f}%"
+        if use_multistage:
+            status += "   [MULTI-STAGE]"
         self.train_status.config(text=status, foreground="green")
 
         self._plot_training(X_te, y_te, y_pred, raw_te)
@@ -1054,6 +1202,7 @@ class UWBBLECalApp:
                     "dist_feats":  self.dist_feats,
                     "angle_model": self.angle_model,
                     "angle_feats": self.angle_feats,
+                    "nlos_model":  self.model_meta.get("nlos_model"),
                     "meta":        self.model_meta,
                 }, f)
             messagebox.showinfo("Saved", f"Models saved to {p}")
@@ -1098,7 +1247,8 @@ class UWBBLECalApp:
             self.infer_status.config(text="Active", foreground="green")
 
     def _update_inference(self, pkt: dict):
-        """Apply the distance corrector (and optional angle classifier) to one packet."""
+        """Apply the multi-stage pipeline (NLOS classifier + distance corrector
+        + optional angle classifier) to one packet."""
         if not self._infer_active or self.dist_model is None:
             return
 
@@ -1108,6 +1258,16 @@ class UWBBLECalApp:
             df1 = engineer(pd.DataFrame([row]))
         except Exception:
             return
+
+        # Channel condition and confidence from engineered features
+        ch_label = "?"
+        conf_val = 0.0
+        ch_names = {0: "LOS", 1: "MARGINAL", 2: "NLOS"}
+        if "channel_condition" in df1.columns:
+            ch = int(df1["channel_condition"].iloc[0])
+            ch_label = ch_names.get(ch, "?")
+        if "confidence" in df1.columns:
+            conf_val = float(df1["confidence"].iloc[0])
 
         # Distance prediction
         try:
@@ -1148,7 +1308,8 @@ class UWBBLECalApp:
         self.i_raw_lbl.config(text=f"{raw:.3f} m")
         self.i_corr_lbl.config(text=f"{corr:.3f} m")
         self.i_err_lbl.config(
-            text=f"{err:+.3f} m" if not np.isnan(err) else "—",
+            text=f"{err:+.3f} m  [{ch_label}  conf={conf_val:.2f}]"
+            if not np.isnan(err) else f"[{ch_label}  conf={conf_val:.2f}]",
             foreground=(
                 "#00cc88"
                 if (not np.isnan(err) and abs(err) < abs(raw_err))
