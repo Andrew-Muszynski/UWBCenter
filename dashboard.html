@@ -205,6 +205,82 @@
     #empty-state p { margin-top: 8px; font-size: 0.9rem; }
     .pulse { animation: pulse 1.4s ease-in-out infinite; }
     @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.4} }
+
+    /* ── Settings panel ── */
+    .settings-card {
+      background: #161b22;
+      border: 1px solid #30363d;
+      border-radius: 10px;
+      padding: 18px 20px;
+      margin-top: 20px;
+      border-top: 3px solid #f0883e;
+    }
+    .settings-card h3 {
+      font-size: 0.85rem;
+      font-weight: 600;
+      color: #e6edf3;
+      margin-bottom: 14px;
+    }
+    .setting-row {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      margin-bottom: 10px;
+    }
+    .setting-row label {
+      font-size: 0.75rem;
+      color: #8b949e;
+      min-width: 100px;
+    }
+    .setting-row input {
+      background: #0d1117;
+      border: 1px solid #30363d;
+      border-radius: 6px;
+      color: #e6edf3;
+      padding: 6px 10px;
+      font-size: 0.85rem;
+      width: 100px;
+      outline: none;
+    }
+    .setting-row input:focus {
+      border-color: #388bfd;
+    }
+    .btn-cmd {
+      background: #21262d;
+      border: 1px solid #30363d;
+      border-radius: 6px;
+      color: #e6edf3;
+      padding: 6px 14px;
+      font-size: 0.75rem;
+      cursor: pointer;
+      transition: background 0.15s;
+    }
+    .btn-cmd:hover { background: #30363d; }
+    .btn-cmd.primary { background: #1f6feb; border-color: #388bfd; }
+    .btn-cmd.primary:hover { background: #388bfd; }
+    .btn-cmd.warn { background: #6e3a00; border-color: #f0883e; }
+    .btn-cmd.warn:hover { background: #f0883e; color: #000; }
+    .cmd-feedback {
+      font-size: 0.7rem;
+      color: #3fb950;
+      margin-top: 4px;
+      min-height: 16px;
+    }
+    .cmd-feedback.error { color: #f85149; }
+    .settings-status {
+      font-size: 0.7rem;
+      color: #8b949e;
+      margin-top: 10px;
+      padding-top: 10px;
+      border-top: 1px solid #21262d;
+    }
+    .settings-status .dev-setting {
+      display: flex;
+      justify-content: space-between;
+      padding: 3px 0;
+    }
+    .settings-status .dev-name { color: #79c0ff; font-weight: 600; }
+    .settings-status .dev-val { color: #e6edf3; }
   </style>
 </head>
 <body>
@@ -236,6 +312,34 @@
       <div id="log-info" style="display:none">
         Tag log: <span id="tag-log-path">—</span><br>
         Anchor log: <span id="anchor-log-path">—</span>
+      </div>
+
+      <!-- ── Device Settings Panel ── -->
+      <div id="settings-panel" style="display:none">
+        <div class="settings-card">
+          <h3>Device Settings</h3>
+
+          <div class="setting-row">
+            <label>Antenna Delay:</label>
+            <input type="number" id="ad-input" value="16700" min="0" max="65535" step="1">
+            <button class="btn-cmd primary" onclick="setAllDelay()">Set Both</button>
+          </div>
+
+          <div class="setting-row">
+            <label>Range Interval:</label>
+            <input type="number" id="ri-input" value="500" min="50" max="5000" step="50">
+            <span style="font-size:0.7rem;color:#8b949e">ms</span>
+            <button class="btn-cmd" onclick="setTagInterval()">Set Tag</button>
+          </div>
+
+          <div class="setting-row">
+            <button class="btn-cmd" onclick="queryAll()">Refresh Settings</button>
+          </div>
+
+          <div class="cmd-feedback" id="cmd-feedback"></div>
+
+          <div class="settings-status" id="device-settings-display"></div>
+        </div>
       </div>
     </div>
 
@@ -856,10 +960,119 @@ async function poll() {
       if (pos) pushTrail(n, pos);
     });
     drawMap(devices);
+    updateSettingsDisplay(devices);
 
   } catch (e) {
     document.getElementById("status-dot").classList.add("stale");
   }
+}
+
+// ── Command functions ─────────────────────────────────────────
+function showFeedback(msg, isError) {
+  const el = document.getElementById("cmd-feedback");
+  el.textContent = msg;
+  el.className = "cmd-feedback" + (isError ? " error" : "");
+  setTimeout(() => { el.textContent = ""; }, 4000);
+}
+
+async function setAllDelay() {
+  const val = parseInt(document.getElementById("ad-input").value);
+  if (isNaN(val) || val < 0 || val > 65535) {
+    showFeedback("Antenna delay must be 0 to 65535", true);
+    return;
+  }
+  try {
+    const resp = await fetch("/api/set_all_delay", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({delay: val})
+    });
+    const data = await resp.json();
+    if (resp.ok) {
+      showFeedback("Queued AD:" + val + " on " + (data.devices || []).join(", "));
+    } else {
+      showFeedback(data.error || "Failed", true);
+    }
+  } catch (e) {
+    showFeedback("Network error: " + e.message, true);
+  }
+}
+
+async function setTagInterval() {
+  const val = parseInt(document.getElementById("ri-input").value);
+  if (isNaN(val) || val < 50 || val > 5000) {
+    showFeedback("Range interval must be 50 to 5000 ms", true);
+    return;
+  }
+  try {
+    // Find the first connected tag
+    const resp = await fetch("/api/state");
+    const state = await resp.json();
+    const tags = Object.keys(state.devices || {}).filter(
+      n => state.devices[n].type === "tag" && state.devices[n].connected
+    );
+    if (tags.length === 0) {
+      showFeedback("No connected tags found", true);
+      return;
+    }
+    const r = await fetch("/api/command", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({device: tags[0], command: "RI:" + val})
+    });
+    const d = await r.json();
+    if (r.ok) {
+      showFeedback("Queued RI:" + val + " on " + tags[0]);
+    } else {
+      showFeedback(d.error || "Failed", true);
+    }
+  } catch (e) {
+    showFeedback("Network error: " + e.message, true);
+  }
+}
+
+async function queryAll() {
+  try {
+    const resp = await fetch("/api/state");
+    const state = await resp.json();
+    const connected = Object.keys(state.devices || {}).filter(
+      n => state.devices[n].connected
+    );
+    for (const name of connected) {
+      await fetch("/api/command", {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({device: name, command: "ST"})
+      });
+    }
+    showFeedback("Queried " + connected.join(", "));
+  } catch (e) {
+    showFeedback("Network error: " + e.message, true);
+  }
+}
+
+function updateSettingsDisplay(devices) {
+  const panel = document.getElementById("settings-panel");
+  const display = document.getElementById("device-settings-display");
+  const names = Object.keys(devices).sort();
+  if (names.length === 0) {
+    panel.style.display = "none";
+    return;
+  }
+  panel.style.display = "";
+  let html = "";
+  for (const name of names) {
+    const d = devices[name];
+    const s = d.settings || {};
+    const conn = d.connected ? "connected" : "offline";
+    html += '<div class="dev-setting">';
+    html += '<span class="dev-name">' + name + '</span>';
+    html += '<span class="dev-val">AD:' + (s.antenna_delay || 0);
+    if (d.type === "tag") html += ' RI:' + (s.range_interval || 500) + 'ms';
+    html += ' (' + conn + ')</span>';
+    html += '</div>';
+  }
+  display.innerHTML = html;
 }
 
 poll();

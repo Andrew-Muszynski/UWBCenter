@@ -22,11 +22,12 @@ from collections import deque
 from pathlib import Path
 
 from bleak import BleakScanner, BleakClient
-from flask import Flask, render_template, jsonify, make_response
+from flask import Flask, render_template, jsonify, make_response, request
 
 # ─────────────────────── CONFIG ───────────────────────
 TAG_CHAR_UUID    = "19b10011-e8f2-537e-4f6c-d104768a1214"
 ANCHOR_CHAR_UUID = "19b10012-e8f2-537e-4f6c-d104768a1214"
+CMD_CHAR_UUID    = "19b10013-e8f2-537e-4f6c-d104768a1214"
 
 # Device names to look for (expand as needed)
 TAG_NAMES    = [f"T{i}" for i in range(1, 11)]
@@ -47,8 +48,16 @@ lock = threading.Lock()
 
 # device_name → { "type": "tag"|"anchor", "connected": bool,
 #                  "latest": dict, "history": deque, "addr": str,
-#                  "connect_time": str, "packet_count": int }
+#                  "connect_time": str, "packet_count": int,
+#                  "settings": dict }
 devices = {}
+
+# Active BleakClient references for sending commands
+active_clients = {}   # device_name → BleakClient
+
+# Command queue: Flask thread appends; BLE thread processes
+pending_commands = []  # list of (device_name, command_string)
+cmd_lock = threading.Lock()
 
 session_start = datetime.datetime.now().isoformat(timespec="seconds")
 
@@ -65,6 +74,7 @@ def init_device(name, addr, dev_type):
                 "latest": {},
                 "history": deque(maxlen=HISTORY_LEN),
                 "packet_count": 0,
+                "settings": {"antenna_delay": 0, "range_interval": 500},
             }
 
 
@@ -258,12 +268,30 @@ async def handle_tag(ble_device):
                     )
 
                 await client.start_notify(TAG_CHAR_UUID, on_notify)
+
+                # Store client reference for command sending
+                active_clients[name] = client
+
+                # Query initial settings
+                try:
+                    await client.write_gatt_char(CMD_CHAR_UUID, b"ST")
+                    await asyncio.sleep(0.3)
+                    resp = await client.read_gatt_char(CMD_CHAR_UUID)
+                    settings_str = resp.decode("utf-8", errors="replace")
+                    _parse_settings(name, settings_str)
+                    print(f"[{name}] Settings: {settings_str}")
+                except Exception as e:
+                    print(f"[{name}] Could not read settings: {e}")
+
                 while client.is_connected:
-                    await asyncio.sleep(0.5)   # faster disconnect detection
+                    # Process any pending commands for this device
+                    await _process_pending_commands(name, client)
+                    await asyncio.sleep(0.5)
 
         except Exception as e:
             print(f"[!] {name}: {e}")
 
+        active_clients.pop(name, None)
         with lock:
             devices[name]["connected"] = False
         print(f"[-] {name} disconnected — retry in {RECONNECT_SEC}s")
@@ -311,12 +339,29 @@ async def handle_anchor(ble_device):
                     )
 
                 await client.start_notify(ANCHOR_CHAR_UUID, on_notify)
+
+                # Store client reference for command sending
+                active_clients[name] = client
+
+                # Query initial settings
+                try:
+                    await client.write_gatt_char(CMD_CHAR_UUID, b"ST")
+                    await asyncio.sleep(0.3)
+                    resp = await client.read_gatt_char(CMD_CHAR_UUID)
+                    settings_str = resp.decode("utf-8", errors="replace")
+                    _parse_settings(name, settings_str)
+                    print(f"[{name}] Settings: {settings_str}")
+                except Exception as e:
+                    print(f"[{name}] Could not read settings: {e}")
+
                 while client.is_connected:
-                    await asyncio.sleep(0.5)   # faster disconnect detection
+                    await _process_pending_commands(name, client)
+                    await asyncio.sleep(0.5)
 
         except Exception as e:
             print(f"[!] {name}: {e}")
 
+        active_clients.pop(name, None)
         with lock:
             devices[name]["connected"] = False
         print(f"[-] {name} disconnected — retry in {RECONNECT_SEC}s")
@@ -324,6 +369,53 @@ async def handle_anchor(ble_device):
 
         # Refresh device object in case the Arduino rebooted/changed address
         current = await _refresh_device(name, current)
+
+
+# ─────────────────────── COMMAND HELPERS ───────────────────────
+
+def _parse_settings(name, settings_str):
+    """Parse settings response like 'AD:16700 RI:500' into device state."""
+    with lock:
+        if name not in devices:
+            return
+        for part in settings_str.strip().split():
+            if part.startswith("AD:"):
+                try:
+                    devices[name]["settings"]["antenna_delay"] = int(part[3:])
+                except ValueError:
+                    pass
+            elif part.startswith("RI:"):
+                try:
+                    devices[name]["settings"]["range_interval"] = int(part[3:])
+                except ValueError:
+                    pass
+
+
+async def _process_pending_commands(name, client):
+    """Send any queued commands for this device over BLE."""
+    to_send = []
+    with cmd_lock:
+        remaining = []
+        for dev, cmd in pending_commands:
+            if dev == name:
+                to_send.append(cmd)
+            else:
+                remaining.append((dev, cmd))
+        pending_commands.clear()
+        pending_commands.extend(remaining)
+
+    for cmd in to_send:
+        try:
+            print(f"[CMD] Sending to {name}: {cmd}")
+            await client.write_gatt_char(CMD_CHAR_UUID, cmd.encode("utf-8"))
+            await asyncio.sleep(0.3)
+            # Read back response
+            resp = await client.read_gatt_char(CMD_CHAR_UUID)
+            resp_str = resp.decode("utf-8", errors="replace")
+            print(f"[CMD] {name} response: {resp_str}")
+            _parse_settings(name, resp_str)
+        except Exception as e:
+            print(f"[CMD] Error sending to {name}: {e}")
 
 
 # ─────────────────────── FLASK DASHBOARD ───────────────────────
@@ -352,6 +444,7 @@ def api_state():
                 "packet_count": d["packet_count"],
                 "latest": d["latest"],
                 "history": hist,
+                "settings": d.get("settings", {}),
             }
     return jsonify({
         "session_start": session_start,
@@ -359,6 +452,91 @@ def api_state():
         "tag_log": str(tag_csv_path),
         "anchor_log": str(anchor_csv_path),
     })
+
+
+@app.route("/api/command", methods=["POST"])
+def api_command():
+    """Send a command to a device over BLE.
+
+    JSON body: { "device": "T1", "command": "AD:16700" }
+    Supported commands:
+      AD:<value>  - Set antenna delay register (0 to 65535)
+      RI:<value>  - Set range interval in ms (50 to 5000, tags only)
+      ST          - Query current settings
+    """
+    data = request.get_json(silent=True)
+    if not data:
+        return jsonify({"error": "JSON body required"}), 400
+
+    device = data.get("device", "").strip()
+    command = data.get("command", "").strip()
+
+    if not device or not command:
+        return jsonify({"error": "device and command fields required"}), 400
+
+    with lock:
+        if device not in devices:
+            return jsonify({"error": f"Unknown device: {device}"}), 404
+        if not devices[device]["connected"]:
+            return jsonify({"error": f"{device} is not connected"}), 409
+
+    # Validate command format
+    if command.startswith("AD:"):
+        try:
+            val = int(command[3:])
+            if val < 0 or val > 65535:
+                return jsonify({"error": "Antenna delay must be 0 to 65535"}), 400
+        except ValueError:
+            return jsonify({"error": "AD value must be an integer"}), 400
+    elif command.startswith("RI:"):
+        try:
+            val = int(command[3:])
+            if val < 50 or val > 5000:
+                return jsonify({"error": "Range interval must be 50 to 5000 ms"}), 400
+        except ValueError:
+            return jsonify({"error": "RI value must be an integer"}), 400
+    elif command != "ST":
+        return jsonify({"error": f"Unknown command: {command}"}), 400
+
+    # Queue the command for the BLE thread to process
+    with cmd_lock:
+        pending_commands.append((device, command))
+
+    return jsonify({"status": "queued", "device": device, "command": command})
+
+
+@app.route("/api/set_all_delay", methods=["POST"])
+def api_set_all_delay():
+    """Convenience: set antenna delay on ALL connected devices at once.
+
+    JSON body: { "delay": 16700 }
+    """
+    data = request.get_json(silent=True)
+    if not data:
+        return jsonify({"error": "JSON body required"}), 400
+
+    delay_val = data.get("delay")
+    if delay_val is None:
+        return jsonify({"error": "delay field required"}), 400
+
+    try:
+        delay_val = int(delay_val)
+        if delay_val < 0 or delay_val > 65535:
+            return jsonify({"error": "Delay must be 0 to 65535"}), 400
+    except (ValueError, TypeError):
+        return jsonify({"error": "Delay must be an integer"}), 400
+
+    queued = []
+    with lock:
+        connected = [n for n, d in devices.items() if d["connected"]]
+
+    cmd = f"AD:{delay_val}"
+    with cmd_lock:
+        for name in connected:
+            pending_commands.append((name, cmd))
+            queued.append(name)
+
+    return jsonify({"status": "queued", "command": cmd, "devices": queued})
 
 
 def run_flask():
