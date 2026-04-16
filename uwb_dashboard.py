@@ -17,10 +17,13 @@ import struct
 import threading
 import signal
 import csv
+import math
 import datetime
 from collections import deque
 from pathlib import Path
 
+import numpy as np
+import pandas as pd
 from bleak import BleakScanner, BleakClient
 from flask import Flask, render_template, jsonify, make_response, request
 
@@ -38,10 +41,13 @@ SCAN_TIMEOUT    = 8.0    # BLE scan duration per sweep (seconds)
 RESCAN_INTERVAL = 15.0   # seconds between sweeps (picks up late-joining devices)
 RECONNECT_SEC   = 3      # seconds to wait before each reconnect attempt
 HISTORY_LEN     = 200    # packets kept in memory per device
-FLASK_PORT      = 5000
+FLASK_PORT      = 5050
 
 LOG_DIR = Path("logs")
 LOG_DIR.mkdir(exist_ok=True)
+
+# Current antenna delay – used to route logs into AD_<value> subfolders
+current_antenna_delay = 0   # 0 = unknown / not yet set
 
 # ─────────────────────── SHARED STATE ───────────────────────
 lock = threading.Lock()
@@ -60,6 +66,93 @@ pending_commands = []  # list of (device_name, command_string)
 cmd_lock = threading.Lock()
 
 session_start = datetime.datetime.now().isoformat(timespec="seconds")
+
+# ─────────────────────── DATA COLLECTION STATE ───────────────────────
+collection_lock = threading.Lock()
+collection = {
+    "active": False,
+    "true_dist_m": 0.0,
+    "angle_deg": 0.0,
+    "notes": "",
+    "session_id": "",
+    "target_samples": 500,
+    "samples": [],          # list of labelled dicts
+}
+
+def _ad_subdir():
+    """Return the antenna-delay subfolder, e.g. logs/AD_16700/."""
+    ad = current_antenna_delay
+    name = f"AD_{ad}" if ad else "AD_unknown"
+    d = LOG_DIR / name
+    d.mkdir(exist_ok=True)
+    return d
+
+def _cal_dataset_path():
+    """Return the per-antenna-delay calibration CSV path."""
+    return _ad_subdir() / "ble_cal_dataset.csv"
+CAL_COLUMNS = [
+    "timestamp", "device", "session_id", "seq",
+    "true_dist_m", "angle_deg", "distance_m",
+    "rx_power", "fp_power", "fp_rx_ratio", "quality",
+    "std_noise", "fp_ampl1", "fp_ampl2", "fp_ampl3",
+    "cir_power", "rxpacc", "nlos_suspect", "anchor_id",
+    "error_m", "antenna_delay", "notes",
+]
+
+
+def _collect_tag_packet(name, pkt):
+    """If collection is active, label and store the tag packet."""
+    with collection_lock:
+        if not collection["active"]:
+            return
+        d = pkt.get("distance_m", float("nan"))
+        td = collection["true_dist_m"]
+        err = d - td if not math.isnan(d) else float("nan")
+        row = {
+            "timestamp":    pkt.get("_ts", datetime.datetime.now().isoformat(timespec="milliseconds")),
+            "device":       name,
+            "session_id":   collection["session_id"],
+            "seq":          pkt.get("seq", 0),
+            "true_dist_m":  td,
+            "angle_deg":    collection["angle_deg"],
+            "distance_m":   d,
+            "rx_power":     pkt.get("rx_power", float("nan")),
+            "fp_power":     pkt.get("fp_power", float("nan")),
+            "fp_rx_ratio":  pkt.get("fp_rx_ratio", float("nan")),
+            "quality":      pkt.get("quality", float("nan")),
+            "std_noise":    pkt.get("std_noise", float("nan")),
+            "fp_ampl1":     pkt.get("fp_ampl1", float("nan")),
+            "fp_ampl2":     pkt.get("fp_ampl2", float("nan")),
+            "fp_ampl3":     pkt.get("fp_ampl3", float("nan")),
+            "cir_power":    pkt.get("cir_power", float("nan")),
+            "rxpacc":       pkt.get("rxpacc", float("nan")),
+            "nlos_suspect": pkt.get("nlos_suspect", False),
+            "anchor_id":    pkt.get("anchor_id", 0),
+            "error_m":      err,
+            "antenna_delay": current_antenna_delay,
+            "notes":        collection["notes"],
+        }
+        collection["samples"].append(row)
+        # Auto-stop if target reached
+        if len(collection["samples"]) >= collection["target_samples"]:
+            collection["active"] = False
+
+
+def _save_collection():
+    """Append collected samples to the cal dataset CSV."""
+    with collection_lock:
+        samples = list(collection["samples"])
+    if not samples:
+        return 0
+    new_df = pd.DataFrame(samples, columns=CAL_COLUMNS)
+    cal_path = _cal_dataset_path()
+    if cal_path.exists():
+        existing = pd.read_csv(cal_path)
+        combined = pd.concat([existing, new_df], ignore_index=True)
+    else:
+        combined = new_df
+    combined.to_csv(cal_path, index=False)
+    return len(samples)
 
 
 def init_device(name, addr, dev_type):
@@ -157,29 +250,44 @@ def unpack_anchor(data: bytes) -> dict:
 
 
 # ─────────────────────── CSV LOGGER ───────────────────────
-ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-tag_csv_path    = LOG_DIR / f"tag_data_{ts}.csv"
-anchor_csv_path = LOG_DIR / f"anchor_data_{ts}.csv"
-
-tag_csv    = open(tag_csv_path, "w", newline="")
-anchor_csv = open(anchor_csv_path, "w", newline="")
-
-tag_writer = csv.writer(tag_csv)
-tag_writer.writerow([
+TAG_HEADER = [
     "timestamp", "device", "anchor_id", "seq", "distance_m",
     "rx_power", "fp_power", "fp_rx_ratio", "quality",
     "round_trip", "reply_delay",
     "std_noise", "fp_ampl1", "fp_ampl2", "fp_ampl3",
     "cir_power", "rxpacc", "flags", "anchor_count", "nlos_suspect",
-])
-
-anchor_writer = csv.writer(anchor_csv)
-anchor_writer.writerow([
+]
+ANCHOR_HEADER = [
     "timestamp", "device", "tag_id", "seq",
     "rx_power", "fp_power", "fp_rx_ratio", "quality",
     "std_noise", "fp_ampl1", "fp_ampl2", "fp_ampl3",
     "cir_power", "rxpacc", "reply_delay", "flags",
-])
+]
+
+def _open_log_csvs(label=""):
+    """Open (or re-open) tag/anchor CSV log files in the current AD subfolder.
+
+    If *label* is given (e.g. '1.0m_0deg') it becomes the leading part of
+    the filename so you can identify the distance at a glance:
+        tag_1.0m_0deg_20260326_143523.csv
+    Without a label, generic logs are created:
+        tag_20260326_143523.csv
+    """
+    global tag_csv, anchor_csv, tag_writer, anchor_writer, tag_csv_path, anchor_csv_path
+    ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    prefix = f"{label}_" if label else ""
+    subdir = _ad_subdir()
+    tag_csv_path    = subdir / f"tag_{prefix}{ts}.csv"
+    anchor_csv_path = subdir / f"anchor_{prefix}{ts}.csv"
+    tag_csv    = open(tag_csv_path, "w", newline="")
+    anchor_csv = open(anchor_csv_path, "w", newline="")
+    tag_writer = csv.writer(tag_csv)
+    tag_writer.writerow(TAG_HEADER)
+    anchor_writer = csv.writer(anchor_csv)
+    anchor_writer.writerow(ANCHOR_HEADER)
+    print(f"  Log dir: {subdir.resolve()}  ({tag_csv_path.name})")
+
+_open_log_csvs()
 
 
 def log_tag(name, pkt):
@@ -255,6 +363,7 @@ async def handle_tag(ble_device):
                         devices[name]["history"].append(pkt)
                         devices[name]["packet_count"] += 1
                     log_tag(name, pkt)
+                    _collect_tag_packet(name, pkt)
 
                     flag = " NLOS?" if pkt["nlos_suspect"] else ""
                     print(
@@ -375,13 +484,23 @@ async def handle_anchor(ble_device):
 
 def _parse_settings(name, settings_str):
     """Parse settings response like 'AD:16700 RI:500' into device state."""
+    global current_antenna_delay
     with lock:
         if name not in devices:
             return
         for part in settings_str.strip().split():
             if part.startswith("AD:"):
                 try:
-                    devices[name]["settings"]["antenna_delay"] = int(part[3:])
+                    ad_val = int(part[3:])
+                    devices[name]["settings"]["antenna_delay"] = ad_val
+                    if ad_val and ad_val != current_antenna_delay:
+                        old_ad = current_antenna_delay
+                        current_antenna_delay = ad_val
+                        # Close current log CSVs and open new ones in the new AD folder
+                        tag_csv.close()
+                        anchor_csv.close()
+                        _open_log_csvs()
+                        print(f"  Antenna delay changed {old_ad} → {ad_val}, logs rotated")
                 except ValueError:
                     pass
             elif part.startswith("RI:"):
@@ -451,6 +570,7 @@ def api_state():
         "devices": result,
         "tag_log": str(tag_csv_path),
         "anchor_log": str(anchor_csv_path),
+        "antenna_delay": current_antenna_delay,
     })
 
 
@@ -537,6 +657,143 @@ def api_set_all_delay():
             queued.append(name)
 
     return jsonify({"status": "queued", "command": cmd, "devices": queued})
+
+
+# ─────────────────────── DATA COLLECTION API ───────────────────────
+
+@app.route("/api/collection/start", methods=["POST"])
+def api_collection_start():
+    """Start labelled data collection.
+
+    JSON body: { "true_dist_m": 1.0, "angle_deg": 0, "notes": "", "target_samples": 500 }
+    """
+    data = request.get_json(silent=True)
+    if not data:
+        return jsonify({"error": "JSON body required"}), 400
+
+    try:
+        td = float(data.get("true_dist_m", 0))
+    except (ValueError, TypeError):
+        return jsonify({"error": "true_dist_m must be a number"}), 400
+
+    if td < 0:
+        return jsonify({"error": "true_dist_m must be >= 0"}), 400
+
+    angle = float(data.get("angle_deg", 0))
+    notes = str(data.get("notes", ""))
+    target = int(data.get("target_samples", 500))
+    if target < 1:
+        target = 500
+
+    with collection_lock:
+        collection["active"] = True
+        collection["true_dist_m"] = td
+        collection["angle_deg"] = angle
+        collection["notes"] = notes
+        collection["session_id"] = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        collection["target_samples"] = target
+        collection["samples"] = []
+
+    # Rotate log CSVs so this run gets its own files labelled with distance/angle
+    tag_csv.close()
+    anchor_csv.close()
+    label = f"{td}m_{int(angle)}deg"
+    _open_log_csvs(label=label)
+
+    return jsonify({
+        "status": "started",
+        "true_dist_m": td,
+        "angle_deg": angle,
+        "target_samples": target,
+        "session_id": collection["session_id"],
+    })
+
+
+@app.route("/api/collection/stop", methods=["POST"])
+def api_collection_stop():
+    """Stop collection and save to dataset CSV."""
+    with collection_lock:
+        collection["active"] = False
+
+    saved = _save_collection()
+
+    # Rotate back to generic (unlabelled) log files
+    tag_csv.close()
+    anchor_csv.close()
+    _open_log_csvs()
+
+    with collection_lock:
+        samples = collection["samples"]
+        if samples:
+            dists = [s["distance_m"] for s in samples
+                     if isinstance(s["distance_m"], (int, float)) and not math.isnan(s["distance_m"])]
+            errors = [s["error_m"] for s in samples
+                      if isinstance(s["error_m"], (int, float)) and not math.isnan(s["error_m"])]
+            stats = {
+                "count": len(samples),
+                "mean_dist": float(np.mean(dists)) if dists else None,
+                "std_dist": float(np.std(dists)) if dists else None,
+                "mean_error": float(np.mean(errors)) if errors else None,
+                "true_dist_m": collection["true_dist_m"],
+                "angle_deg": collection["angle_deg"],
+            }
+        else:
+            stats = {"count": 0}
+
+    return jsonify({"status": "stopped", "saved": saved, "stats": stats})
+
+
+@app.route("/api/collection/status")
+def api_collection_status():
+    """Get current collection state and live stats."""
+    with collection_lock:
+        active = collection["active"]
+        samples = list(collection["samples"])
+        td = collection["true_dist_m"]
+        angle = collection["angle_deg"]
+        target = collection["target_samples"]
+        sid = collection["session_id"]
+
+    count = len(samples)
+    dists = [s["distance_m"] for s in samples
+             if isinstance(s["distance_m"], (int, float)) and not math.isnan(s["distance_m"])]
+    errors = [s["error_m"] for s in samples
+              if isinstance(s["error_m"], (int, float)) and not math.isnan(s["error_m"])]
+
+    return jsonify({
+        "active": active,
+        "session_id": sid,
+        "true_dist_m": td,
+        "angle_deg": angle,
+        "target_samples": target,
+        "count": count,
+        "mean_dist": float(np.mean(dists)) if dists else None,
+        "std_dist": float(np.std(dists)) if dists else None,
+        "mean_error": float(np.mean(errors)) if errors else None,
+        "last_5_dists": [s["distance_m"] for s in samples[-5:]],
+    })
+
+
+@app.route("/api/collection/dataset_info")
+def api_collection_dataset_info():
+    """Show info about the saved calibration dataset."""
+    cal_path = _cal_dataset_path()
+    if not cal_path.exists():
+        return jsonify({"exists": False, "total_samples": 0, "distances": []})
+    df = pd.read_csv(cal_path)
+    dist_summary = []
+    for td in sorted(df["true_dist_m"].unique()):
+        sub = df[df["true_dist_m"] == td]
+        dist_summary.append({
+            "true_dist_m": float(td),
+            "count": len(sub),
+            "angles": sorted(sub["angle_deg"].unique().tolist()),
+        })
+    return jsonify({
+        "exists": True,
+        "total_samples": len(df),
+        "distances": dist_summary,
+    })
 
 
 def run_flask():

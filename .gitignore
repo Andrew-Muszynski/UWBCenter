@@ -1,3 +1,7 @@
 __pycache__/
 *.pyc
 *.pyo
+.venv/
+*.pkl
+.dashboard.pid
+dashboard.log

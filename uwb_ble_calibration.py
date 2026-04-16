@@ -6,7 +6,7 @@ Works alongside uwb_dashboard.py (must be running at localhost:5000).
 
 Workflow:
   1. Collect  — label live BLE packets with known distance + orientation angle
-  2. Import   — bulk-load existing logs/tag_data_*.csv files with labels
+  2. Import   — bulk-load existing logs/tag_*.csv files with labels
   3. Dataset  — view and manage accumulated calibration data
   4. Train    — fit a distance corrector (regression) and optional angle
                 classifier (random forest) on the labelled data
@@ -57,7 +57,7 @@ from matplotlib.figure import Figure
 
 # ═══════════════════════════════ CONFIGURATION ════════════════════════════════
 
-DASHBOARD_URL  = "http://localhost:5000/api/state"
+DASHBOARD_URL  = "http://localhost:5050/api/state"
 POLL_INTERVAL  = 0.5          # seconds between /api/state polls
 DATASET_FILE   = "ble_cal_dataset.csv"
 ANGLE_CHOICES  = ["0", "45", "90", "135", "180", "225", "270", "315"]
@@ -357,7 +357,7 @@ class UWBBLECalApp:
     def _build_import_tab(self):
         t = self.t_import
 
-        info = ttk.LabelFrame(t, text="Import Existing tag_data_*.csv Logs", padding=10)
+        info = ttk.LabelFrame(t, text="Import Existing tag_*.csv Logs", padding=10)
         info.pack(fill=tk.X, padx=10, pady=10)
         ttk.Label(info, wraplength=900,
             text=(
@@ -675,7 +675,7 @@ class UWBBLECalApp:
     def _import_logs(self):
         log_dir = Path("logs") if Path("logs").exists() else Path(".")
         paths = filedialog.askopenfilenames(
-            title="Select tag_data_*.csv files",
+            title="Select tag_*.csv files",
             filetypes=[("CSV", "*.csv"), ("All", "*.*")],
             initialdir=str(log_dir))
         if not paths:
