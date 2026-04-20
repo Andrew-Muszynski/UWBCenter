@@ -18,6 +18,11 @@
 #include <DW1000.h>
 #include <ArduinoBLE.h>
 
+// ---------- Serial gating (no-op when no USB host) ----------
+#define SP(x)    do { if (Serial) Serial.print(x); } while (0)
+#define SPLN(x)  do { if (Serial) Serial.println(x); } while (0)
+#define SP2(x,y) do { if (Serial) Serial.print((x), (y)); } while (0)
+
 // ---------- identity ----------
 #define DEVICE_ID   1                     // 1 -> "T1", 2 -> "T2", etc.
 #define DEVICE_NAME "T1"                  // must match DEVICE_ID
