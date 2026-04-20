@@ -2,12 +2,14 @@
 // UWB Tag (T1) — SS-TWR + BLE Telemetry + Remote Commands
 // Board: Arduino Nano 33 BLE Sense Lite + DWM1000 shield
 //
-// Performs Single-Sided TWR with anchor(s), then broadcasts
-// raw timing + signal-quality metrics over BLE so that a
-// Raspberry Pi (or any central) can collect everything.
+// v2: Single-response protocol — anchor sends ONE packet with
+//     both anchor_id and reply_delay, eliminating the resp2
+//     timeout problem entirely.
 //
-// NEW: Accepts commands over BLE to change antenna delay,
-//      range interval, and other settings at runtime.
+// Protocol:
+//   1. Tag sends POLL [0x01, tag_id]
+//   2. Anchor sends RESPONSE [0x02, anchor_id, reply_delay(5 bytes)]
+//   3. Tag computes ToF from round_trip and reply_delay
 //
 // BLE device name format: T1, T2, T3 ...  (set DEVICE_ID below)
 // ============================================================
@@ -35,9 +37,9 @@ const uint8_t PIN_RST = 3;
 
 // ---------- ranging config (runtime-adjustable) ----------
 uint16_t rangeIntervalMs = 500;           // how often to range (ms)
-#define RX_TIMEOUT_MS       80            // per-response wait
+#define RX_TIMEOUT_MS       80            // wait for single response
 #define TX_TIMEOUT_MS       50
-uint16_t antennaDelay = 0;                // current antenna delay register value
+uint16_t antennaDelay = 0;
 
 // ---------- BLE UUIDs ----------
 #define UWB_SERVICE_UUID  "19b10010-e8f2-537e-4f6c-d104768a1214"
@@ -45,7 +47,6 @@ uint16_t antennaDelay = 0;                // current antenna delay register valu
 #define CMD_CHAR_UUID     "19b10013-e8f2-537e-4f6c-d104768a1214"
 
 // ---------- BLE data frame ----------
-// 43 bytes total
 struct __attribute__((packed)) TagFrame {
   uint8_t  anchor_id;
   uint16_t seq;
@@ -67,7 +68,6 @@ struct __attribute__((packed)) TagFrame {
   uint8_t  anchor_count;
 };
 
-// ---------- diagnostics bundle ----------
 struct RxDiag {
   float    rx_power;
   float    fp_power;
@@ -101,7 +101,7 @@ static inline bool waitForRxGood(uint16_t timeoutMs) {
   unsigned long start = millis();
   while ((millis() - start) < timeoutMs) {
     DW1000.readBytes(SYS_STATUS, NO_SUB, status, 5);
-    if (status[1] & 0x40) return true;
+    if (status[1] & 0x40) return true;     // RXDFR + RXFCG
     delayMicroseconds(100);
   }
   return false;
@@ -112,7 +112,7 @@ static inline bool waitForTxDone(uint16_t timeoutMs) {
   unsigned long start = millis();
   while ((millis() - start) < timeoutMs) {
     DW1000.readBytes(SYS_STATUS, NO_SUB, status, 5);
-    if (status[0] & 0x80) return true;
+    if (status[0] & 0x80) return true;     // TXFRS
     delayMicroseconds(50);
   }
   return false;
@@ -146,33 +146,26 @@ RxDiag readRxDiagnostics() {
   return d;
 }
 
-// ---------- Apply antenna delay to DW1000 ----------
 void setAntennaDelay(uint16_t value) {
   antennaDelay = value;
-  // TX_ANTD register: 0x18, sub 0x00, 2 bytes (little-endian)
   byte buf[2] = { (byte)(value & 0xFF), (byte)((value >> 8) & 0xFF) };
   DW1000.writeBytes(0x18, 0x00, buf, 2);
-  // LDE_RXANTD: 0x2E, sub 0x1804, 2 bytes
   DW1000.writeBytes(0x2E, 0x1804, buf, 2);
   Serial.print(F("[CMD] Antenna delay set to: "));
   Serial.println(value);
 }
 
-// ---------- Process BLE command ----------
 void processCommand(const char* cmd) {
   Serial.print(F("[CMD] Received: "));
   Serial.println(cmd);
 
-  // AD:<value> = set antenna delay
   if (strncmp(cmd, "AD:", 3) == 0) {
     uint16_t val = (uint16_t)atoi(cmd + 3);
     setAntennaDelay(val);
-    // Write back confirmation
     char resp[32];
     snprintf(resp, sizeof(resp), "AD:%u OK", val);
     cmdChar.writeValue((uint8_t*)resp, strlen(resp));
   }
-  // RI:<value> = set range interval (ms)
   else if (strncmp(cmd, "RI:", 3) == 0) {
     uint16_t val = (uint16_t)atoi(cmd + 3);
     if (val >= 50 && val <= 5000) {
@@ -185,7 +178,6 @@ void processCommand(const char* cmd) {
       cmdChar.writeValue((uint8_t*)resp, strlen(resp));
     }
   }
-  // ST = status query
   else if (strncmp(cmd, "ST", 2) == 0) {
     char resp[32];
     snprintf(resp, sizeof(resp), "AD:%u RI:%u", antennaDelay, rangeIntervalMs);
@@ -200,7 +192,7 @@ void setup() {
   Serial.begin(115200);
   delay(500);
 
-  Serial.println(F("=== UWB Tag + BLE + CMD  [" DEVICE_NAME "] ==="));
+  Serial.println(F("=== UWB Tag v2 (single-resp) + BLE + CMD  [" DEVICE_NAME "] ==="));
 
   DW1000.begin(PIN_IRQ, PIN_RST);
   DW1000.select(PIN_CS);
@@ -212,13 +204,11 @@ void setup() {
   DW1000.enableMode(DW1000.MODE_LONGDATA_RANGE_LOWPOWER);
   DW1000.commitConfiguration();
 
-  // Disable auto-sleep
   byte pmsc[4];
   DW1000.readBytes(0x36, 0x04, pmsc, 4);
   pmsc[1] &= ~0x18;
   DW1000.writeBytes(0x36, 0x04, pmsc, 4);
 
-  // Disable DW1000 interrupts (we poll)
   byte zeros[4] = {0, 0, 0, 0};
   DW1000.writeBytes(SYS_MASK, NO_SUB, zeros, 4);
 
@@ -237,7 +227,6 @@ void setup() {
   TagFrame z = {};
   tagChar.writeValue((uint8_t*)&z, sizeof(TagFrame));
 
-  // Initialize cmdChar with status
   char initStatus[32];
   snprintf(initStatus, sizeof(initStatus), "AD:%u RI:%u", antennaDelay, rangeIntervalMs);
   cmdChar.writeValue((uint8_t*)initStatus, strlen(initStatus));
@@ -250,7 +239,6 @@ void setup() {
 void loop() {
   BLE.poll();
 
-  // Check for incoming BLE commands
   if (cmdChar.written()) {
     char buf[33] = {0};
     int len = cmdChar.valueLength();
@@ -288,16 +276,21 @@ void loop() {
   DW1000.getTransmitTimestamp(t1);
   clearStatusAll();
 
-  // ========== WAIT FOR RESPONSE #1 (T4) ==========
+  // ========== WAIT FOR SINGLE RESPONSE ==========
+  // Anchor sends: [0x02, anchor_id, reply_delay(5 bytes)] = 7 bytes
+  // The anchor uses delayed TX so its response arrives at a predictable time.
+  // We give a generous timeout to account for the ~3ms fixed reply delay.
   DW1000.newReceive();
   DW1000.setDefaults();
   DW1000.receivePermanently(false);
   DW1000.startReceive();
 
+  // Timeout needs to be > anchor's fixed reply delay (~3ms) + air time + margin
+  // Using 80ms is very generous — could tighten to ~20ms if desired
   if (!waitForRxGood(RX_TIMEOUT_MS)) {
     Serial.print(F("T")); Serial.print(DEVICE_ID);
     Serial.print(F(" #")); Serial.print(rangeSeq);
-    Serial.println(F("  RX TIMEOUT (resp1)"));
+    Serial.println(F("  RX TIMEOUT"));
     clearStatusAll();
     return;
   }
@@ -310,44 +303,30 @@ void loop() {
   uint16_t len1 = DW1000.getDataLength();
   if (len1 > sizeof(rxBuffer)) len1 = sizeof(rxBuffer);
   DW1000.getData(rxBuffer, len1);
-
-  uint8_t anchorId = 1;
-  if (len1 >= 2) anchorId = rxBuffer[1];
-
   clearStatusAll();
 
-  // ========== WAIT FOR RESPONSE #2 (reply delay T3-T2) ==========
-  DW1000.newReceive();
-  DW1000.setDefaults();
-  DW1000.receivePermanently(false);
-  DW1000.startReceive();
-
-  if (!waitForRxGood(RX_TIMEOUT_MS)) {
+  // ---- Validate response format ----
+  // Expected: [MSG_RESPONSE, anchor_id, RD0, RD1, RD2, RD3, RD4] = 7 bytes
+  if (rxBuffer[0] != MSG_RESPONSE || len1 < 7) {
     Serial.print(F("T")); Serial.print(DEVICE_ID);
     Serial.print(F(" #")); Serial.print(rangeSeq);
-    Serial.println(F("  RX TIMEOUT (resp2)"));
-    clearStatusAll();
+    Serial.print(F("  BAD RESP (type=0x"));
+    Serial.print(rxBuffer[0], HEX);
+    Serial.print(F(" len="));
+    Serial.print(len1);
+    Serial.println(F(")"));
     return;
   }
 
-  uint16_t len2 = DW1000.getDataLength();
-  if (len2 > sizeof(rxBuffer)) len2 = sizeof(rxBuffer);
-  DW1000.getData(rxBuffer, len2);
-  clearStatusAll();
+  uint8_t anchorId = rxBuffer[1];
 
-  if (rxBuffer[0] != MSG_RESPONSE || len2 < 6) {
-    Serial.print(F("T")); Serial.print(DEVICE_ID);
-    Serial.print(F(" #")); Serial.print(rangeSeq);
-    Serial.println(F("  BAD RESP2"));
-    return;
-  }
-
+  // Extract reply delay from bytes [2..6]
   int64_t replyDelay = 0;
-  replyDelay |= ((int64_t)rxBuffer[1] <<  0);
-  replyDelay |= ((int64_t)rxBuffer[2] <<  8);
-  replyDelay |= ((int64_t)rxBuffer[3] << 16);
-  replyDelay |= ((int64_t)rxBuffer[4] << 24);
-  replyDelay |= ((int64_t)rxBuffer[5] << 32);
+  replyDelay |= ((int64_t)rxBuffer[2] <<  0);
+  replyDelay |= ((int64_t)rxBuffer[3] <<  8);
+  replyDelay |= ((int64_t)rxBuffer[4] << 16);
+  replyDelay |= ((int64_t)rxBuffer[5] << 24);
+  replyDelay |= ((int64_t)rxBuffer[6] << 32);
 
   // ========== CALCULATE DISTANCE ==========
   int64_t roundTrip = t4.getTimestamp() - t1.getTimestamp();

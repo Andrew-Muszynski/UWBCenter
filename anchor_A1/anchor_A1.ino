@@ -2,12 +2,15 @@
 // UWB Anchor (A1) — SS-TWR Responder + BLE Telemetry + Remote Commands
 // Board: Arduino Nano 33 BLE Sense Lite + DWM1000 shield
 //
-// Listens for POLL messages, sends two responses (immediate +
-// reply-delay payload), and broadcasts its own RX diagnostics
-// over BLE so the Pi dashboard can monitor anchor health too.
+// v4: Raw-register delayed TX — bypasses the DW1000 library's
+//     newTransmit()/setDefaults() overhead to avoid HPDWARN.
+//     Fixed reply delay = 10 ms (generous margin).
 //
-// NEW: Accepts commands over BLE to change antenna delay and
-//      other settings at runtime from the dashboard.
+// Protocol:
+//   1. Tag sends POLL [0x01, tag_id]
+//   2. Anchor receives, schedules delayed TX at T2 + 10ms
+//   3. Anchor sends RESPONSE [0x02, anchor_id, reply_delay(5 bytes)]
+//   4. Tag computes ToF from round_trip and reply_delay
 //
 // BLE device name format: A1, A2, A3 ...  (set DEVICE_ID below)
 // ============================================================
@@ -17,8 +20,8 @@
 #include <ArduinoBLE.h>
 
 // ---------- identity ----------
-#define DEVICE_ID   1                     // 1 -> "A1", 2 -> "A2", etc.
-#define DEVICE_NAME "A1"                  // must match DEVICE_ID
+#define DEVICE_ID   1
+#define DEVICE_NAME "A1"
 
 // ---------- DW1000 wiring ----------
 const uint8_t PIN_CS  = 10;
@@ -32,8 +35,12 @@ const uint8_t PIN_RST = 3;
 // ---------- watchdog ----------
 #define WATCHDOG_MS  5000UL
 
+// ---------- fixed reply delay ----------
+// 10 ms in DW1000 ticks: 10e-3 / 15.65e-12 = 638,977,636
+#define FIXED_REPLY_DLY_TICKS  638977636ULL
+
 // ---------- runtime settings ----------
-uint16_t antennaDelay = 0;                // current antenna delay register value
+uint16_t antennaDelay = 0;
 
 // ---------- BLE UUIDs ----------
 #define UWB_SERVICE_UUID   "19b10010-e8f2-537e-4f6c-d104768a1214"
@@ -41,7 +48,6 @@ uint16_t antennaDelay = 0;                // current antenna delay register valu
 #define CMD_CHAR_UUID      "19b10013-e8f2-537e-4f6c-d104768a1214"
 
 // ---------- BLE data frame ----------
-// 33 bytes total
 struct __attribute__((packed)) AnchorFrame {
   uint8_t  tag_id;
   uint16_t seq;
@@ -113,7 +119,6 @@ void dwmSoftReset() {
   DW1000.enableMode(DW1000.MODE_LONGDATA_RANGE_LOWPOWER);
   DW1000.commitConfiguration();
 
-  // Re-apply antenna delay if set
   if (antennaDelay > 0) {
     byte buf[2] = { (byte)(antennaDelay & 0xFF), (byte)((antennaDelay >> 8) & 0xFF) };
     DW1000.writeBytes(0x18, 0x00, buf, 2);
@@ -160,7 +165,6 @@ RawDiag readRxDiagnostics() {
   return d;
 }
 
-// ---------- Apply antenna delay to DW1000 ----------
 void setAntennaDelay(uint16_t value) {
   antennaDelay = value;
   byte buf[2] = { (byte)(value & 0xFF), (byte)((value >> 8) & 0xFF) };
@@ -170,12 +174,10 @@ void setAntennaDelay(uint16_t value) {
   Serial.println(value);
 }
 
-// ---------- Process BLE command ----------
 void processCommand(const char* cmd) {
   Serial.print(F("[CMD] Received: "));
   Serial.println(cmd);
 
-  // AD:<value> = set antenna delay
   if (strncmp(cmd, "AD:", 3) == 0) {
     uint16_t val = (uint16_t)atoi(cmd + 3);
     setAntennaDelay(val);
@@ -183,7 +185,6 @@ void processCommand(const char* cmd) {
     snprintf(resp, sizeof(resp), "AD:%u OK", val);
     cmdChar.writeValue((uint8_t*)resp, strlen(resp));
   }
-  // ST = status query
   else if (strncmp(cmd, "ST", 2) == 0) {
     char resp[32];
     snprintf(resp, sizeof(resp), "AD:%u", antennaDelay);
@@ -194,11 +195,55 @@ void processCommand(const char* cmd) {
 }
 
 // ============================================================
+// Raw delayed transmit — bypasses library overhead
+// ============================================================
+bool rawDelayedTransmit(byte* data, uint8_t dataLen, uint64_t txTime) {
+  // 1. Write TX data to TX_BUFFER (register 0x09)
+  DW1000.writeBytes(0x09, NO_SUB, data, dataLen);
+
+  // 2. Write TX frame length to TX_FCTRL (register 0x08)
+  //    Bytes [0:6] = frame length (including 2-byte CRC added by DW1000)
+  //    We need to set the length field = dataLen + 2 (for auto-CRC)
+  uint16_t frameLen = dataLen + 2;
+  byte txfctrl[5];
+  DW1000.readBytes(0x08, NO_SUB, txfctrl, 5);
+  txfctrl[0] = (byte)(frameLen & 0xFF);
+  txfctrl[1] = (txfctrl[1] & 0xFC) | (byte)((frameLen >> 8) & 0x03);
+  DW1000.writeBytes(0x08, NO_SUB, txfctrl, 5);
+
+  // 3. Write DX_TIME (register 0x0A, 5 bytes) — the target TX timestamp
+  byte dxTime[5];
+  dxTime[0] = (txTime >>  0) & 0xFF;
+  dxTime[1] = (txTime >>  8) & 0xFF;
+  dxTime[2] = (txTime >> 16) & 0xFF;
+  dxTime[3] = (txTime >> 24) & 0xFF;
+  dxTime[4] = (txTime >> 32) & 0xFF;
+  DW1000.writeBytes(0x0A, NO_SUB, dxTime, 5);
+
+  // 4. Start delayed transmit: SYS_CTRL bit 1 (TXSTRT) + bit 2 (TXDLYE)
+  byte ctrl[1] = { 0x06 };  // TXSTRT | TXDLYE
+  DW1000.writeBytes(0x0D, NO_SUB, ctrl, 1);
+
+  // 5. Wait for completion
+  byte status[5];
+  unsigned long start = millis();
+  while ((millis() - start) < 25) {
+    DW1000.readBytes(SYS_STATUS, NO_SUB, status, 5);
+    // HPDWARN = bit 27 = byte 3 bit 3
+    if (status[3] & 0x08) return false;
+    // TXFRS = bit 7 = byte 0 bit 7
+    if (status[0] & 0x80) return true;
+    delayMicroseconds(50);
+  }
+  return false;  // timeout
+}
+
+// ============================================================
 void setup() {
   Serial.begin(115200);
   delay(500);
 
-  Serial.println(F("=== UWB Anchor + BLE + CMD  [" DEVICE_NAME "] ==="));
+  Serial.println(F("=== UWB Anchor v4 (raw delayed TX) + BLE + CMD  [" DEVICE_NAME "] ==="));
 
   DW1000.begin(PIN_IRQ, PIN_RST);
   DW1000.select(PIN_CS);
@@ -247,7 +292,6 @@ void setup() {
 void loop() {
   BLE.poll();
 
-  // Check for incoming BLE commands
   if (cmdChar.written()) {
     char buf[33] = {0};
     int len = cmdChar.valueLength();
@@ -257,7 +301,6 @@ void loop() {
     processCommand(buf);
   }
 
-  // ---- Background watchdog ----
   if ((uint32_t)(millis() - lastGoodMs) > WATCHDOG_MS) {
     Serial.print(F("[WDT] No exchange for "));
     Serial.print(WATCHDOG_MS);
@@ -274,10 +317,9 @@ void loop() {
   bool goodCRC   = (status[1] & 0x40);
 
   if (dataReady && goodCRC) {
+    // ---- FAST PATH: timestamp + data only ----
     DW1000Time t2;
     DW1000.getReceiveTimestamp(t2);
-
-    RawDiag diag = readRxDiagnostics();
 
     uint16_t len = DW1000.getDataLength();
     if (len > sizeof(rxBuffer)) len = sizeof(rxBuffer);
@@ -291,67 +333,40 @@ void loop() {
       uint8_t tagId = 0;
       if (len >= 2) tagId = rxBuffer[1];
 
-      // ---- Send RESPONSE #1 ----
+      // ---- Build response packet ----
+      int64_t replyDelay = (int64_t)FIXED_REPLY_DLY_TICKS;
+
       txBuffer[0] = MSG_RESPONSE;
       txBuffer[1] = DEVICE_ID;
+      txBuffer[2] = (replyDelay >>  0) & 0xFF;
+      txBuffer[3] = (replyDelay >>  8) & 0xFF;
+      txBuffer[4] = (replyDelay >> 16) & 0xFF;
+      txBuffer[5] = (replyDelay >> 24) & 0xFF;
+      txBuffer[6] = (replyDelay >> 32) & 0xFF;
 
-      DW1000.newTransmit();
-      DW1000.setDefaults();
-      DW1000.setData(txBuffer, 2);
-      DW1000.startTransmit();
+      // ---- Schedule delayed TX ----
+      uint64_t txTime = (uint64_t)t2.getTimestamp() + FIXED_REPLY_DLY_TICKS;
 
-      unsigned long start = millis();
-      bool tx1ok = false;
-      while ((millis() - start) < 50) {
-        DW1000.readBytes(SYS_STATUS, NO_SUB, status, 5);
-        if (status[0] & 0x80) { tx1ok = true; break; }
-        delayMicroseconds(50);
-      }
-      if (!tx1ok) {
-        Serial.println(F("[ERR] TX1 timeout -- resetting DWM"));
+      bool txOk = rawDelayedTransmit(txBuffer, 7, txTime);
+
+      if (!txOk) {
+        Serial.println(F("[ERR] Delayed TX failed (HPDWARN or timeout)"));
         clearStatusAll();
-        dwmSoftReset();
+        startReceiver();
         lastGoodMs = millis();
         return;
       }
 
+      // ---- TX done — now read diagnostics (safe, not time-critical) ----
       DW1000Time t3;
       DW1000.getTransmitTimestamp(t3);
+      int64_t actualReplyDelay = t3.getTimestamp() - t2.getTimestamp();
 
-      int64_t replyDelay = t3.getTimestamp() - t2.getTimestamp();
+      RawDiag diag = readRxDiagnostics();
 
       clearStatusAll();
 
-      // ---- Send RESPONSE #2 (reply delay) ----
-      txBuffer[0] = MSG_RESPONSE;
-      txBuffer[1] = (replyDelay >>  0) & 0xFF;
-      txBuffer[2] = (replyDelay >>  8) & 0xFF;
-      txBuffer[3] = (replyDelay >> 16) & 0xFF;
-      txBuffer[4] = (replyDelay >> 24) & 0xFF;
-      txBuffer[5] = (replyDelay >> 32) & 0xFF;
-
-      DW1000.newTransmit();
-      DW1000.setDefaults();
-      DW1000.setData(txBuffer, 6);
-      DW1000.startTransmit();
-
-      start = millis();
-      bool tx2ok = false;
-      while ((millis() - start) < 50) {
-        DW1000.readBytes(SYS_STATUS, NO_SUB, status, 5);
-        if (status[0] & 0x80) { tx2ok = true; break; }
-        delayMicroseconds(50);
-      }
-      if (!tx2ok) {
-        Serial.println(F("[ERR] TX2 timeout -- resetting DWM"));
-        clearStatusAll();
-        dwmSoftReset();
-        lastGoodMs = millis();
-        return;
-      }
-      clearStatusAll();
-
-      // ---- Build & send BLE frame ----
+      // ---- BLE frame ----
       AnchorFrame frame;
       frame.tag_id         = tagId;
       frame.seq            = rangeSeq;
@@ -364,8 +379,8 @@ void loop() {
       frame.fp_ampl3       = diag.fp_ampl3;
       frame.cir_power      = diag.cir_power;
       frame.rxpacc         = diag.rxpacc;
-      frame.reply_delay_lo = (int32_t)(replyDelay & 0xFFFFFFFFLL);
-      frame.reply_delay_hi = (uint8_t)((replyDelay >> 32) & 0xFF);
+      frame.reply_delay_lo = (int32_t)(actualReplyDelay & 0xFFFFFFFFLL);
+      frame.reply_delay_hi = (uint8_t)((actualReplyDelay >> 32) & 0xFF);
       frame.flags          = 0x01;
 
       anchorChar.writeValue((uint8_t*)&frame, sizeof(AnchorFrame));
@@ -383,7 +398,7 @@ void loop() {
       Serial.print(F("  A2="));   Serial.print(diag.fp_ampl2);
       Serial.print(F("  A3="));   Serial.print(diag.fp_ampl3);
       Serial.print(F("  PACC=")); Serial.print(diag.rxpacc);
-      Serial.print(F("  RD="));   Serial.print((long)replyDelay);
+      Serial.print(F("  RD="));   Serial.print((long)actualReplyDelay);
       Serial.println();
     }
 
