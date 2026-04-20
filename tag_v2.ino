@@ -151,13 +151,13 @@ void setAntennaDelay(uint16_t value) {
   byte buf[2] = { (byte)(value & 0xFF), (byte)((value >> 8) & 0xFF) };
   DW1000.writeBytes(0x18, 0x00, buf, 2);
   DW1000.writeBytes(0x2E, 0x1804, buf, 2);
-  Serial.print(F("[CMD] Antenna delay set to: "));
-  Serial.println(value);
+  SP(F("[CMD] Antenna delay set to: "));
+  SPLN(value);
 }
 
 void processCommand(const char* cmd) {
-  Serial.print(F("[CMD] Received: "));
-  Serial.println(cmd);
+  SP(F("[CMD] Received: "));
+  SPLN(cmd);
 
   if (strncmp(cmd, "AD:", 3) == 0) {
     uint16_t val = (uint16_t)atoi(cmd + 3);
@@ -170,9 +170,9 @@ void processCommand(const char* cmd) {
     uint16_t val = (uint16_t)atoi(cmd + 3);
     if (val >= 50 && val <= 5000) {
       rangeIntervalMs = val;
-      Serial.print(F("[CMD] Range interval set to: "));
-      Serial.print(val);
-      Serial.println(F(" ms"));
+      SP(F("[CMD] Range interval set to: "));
+      SP(val);
+      SPLN(F(" ms"));
       char resp[32];
       snprintf(resp, sizeof(resp), "RI:%u OK", val);
       cmdChar.writeValue((uint8_t*)resp, strlen(resp));
@@ -182,8 +182,8 @@ void processCommand(const char* cmd) {
     char resp[32];
     snprintf(resp, sizeof(resp), "AD:%u RI:%u", antennaDelay, rangeIntervalMs);
     cmdChar.writeValue((uint8_t*)resp, strlen(resp));
-    Serial.print(F("[CMD] Status: "));
-    Serial.println(resp);
+    SP(F("[CMD] Status: "));
+    SPLN(resp);
   }
 }
 
@@ -192,7 +192,7 @@ void setup() {
   Serial.begin(115200);
   delay(500);
 
-  Serial.println(F("=== UWB Tag v2 (single-resp) + BLE + CMD  [" DEVICE_NAME "] ==="));
+  SPLN(F("=== UWB Tag v2 (single-resp) + BLE + CMD  [" DEVICE_NAME "] ==="));
 
   DW1000.begin(PIN_IRQ, PIN_RST);
   DW1000.select(PIN_CS);
@@ -213,7 +213,7 @@ void setup() {
   DW1000.writeBytes(SYS_MASK, NO_SUB, zeros, 4);
 
   if (!BLE.begin()) {
-    Serial.println(F("BLE init failed!"));
+    SPLN(F("BLE init failed!"));
     while (1) delay(1000);
   }
 
@@ -232,7 +232,7 @@ void setup() {
   cmdChar.writeValue((uint8_t*)initStatus, strlen(initStatus));
 
   BLE.advertise();
-  Serial.println(F("BLE advertising. Ranging starts now.\n"));
+  SPLN(F("BLE advertising. Ranging starts now.\n"));
 }
 
 // ============================================================
@@ -265,9 +265,9 @@ void loop() {
   DW1000.startTransmit();
 
   if (!waitForTxDone(TX_TIMEOUT_MS)) {
-    Serial.print(F("T")); Serial.print(DEVICE_ID);
-    Serial.print(F(" #")); Serial.print(rangeSeq);
-    Serial.println(F("  TX TIMEOUT (POLL)"));
+    SP(F("T")); SP(DEVICE_ID);
+    SP(F(" #")); SP(rangeSeq);
+    SPLN(F("  TX TIMEOUT (POLL)"));
     clearStatusAll();
     return;
   }
@@ -288,9 +288,9 @@ void loop() {
   // Timeout needs to be > anchor's fixed reply delay (~3ms) + air time + margin
   // Using 80ms is very generous — could tighten to ~20ms if desired
   if (!waitForRxGood(RX_TIMEOUT_MS)) {
-    Serial.print(F("T")); Serial.print(DEVICE_ID);
-    Serial.print(F(" #")); Serial.print(rangeSeq);
-    Serial.println(F("  RX TIMEOUT"));
+    SP(F("T")); SP(DEVICE_ID);
+    SP(F(" #")); SP(rangeSeq);
+    SPLN(F("  RX TIMEOUT"));
     clearStatusAll();
     return;
   }
@@ -308,13 +308,13 @@ void loop() {
   // ---- Validate response format ----
   // Expected: [MSG_RESPONSE, anchor_id, RD0, RD1, RD2, RD3, RD4] = 7 bytes
   if (rxBuffer[0] != MSG_RESPONSE || len1 < 7) {
-    Serial.print(F("T")); Serial.print(DEVICE_ID);
-    Serial.print(F(" #")); Serial.print(rangeSeq);
-    Serial.print(F("  BAD RESP (type=0x"));
-    Serial.print(rxBuffer[0], HEX);
-    Serial.print(F(" len="));
-    Serial.print(len1);
-    Serial.println(F(")"));
+    SP(F("T")); SP(DEVICE_ID);
+    SP(F(" #")); SP(rangeSeq);
+    SP(F("  BAD RESP (type=0x"));
+    SP2(rxBuffer[0], HEX);
+    SP(F(" len="));
+    SP(len1);
+    SPLN(F(")"));
     return;
   }
 
@@ -364,20 +364,20 @@ void loop() {
   tagChar.writeValue((uint8_t*)&frame, sizeof(TagFrame));
 
   // ========== SERIAL DEBUG ==========
-  Serial.print(F("T")); Serial.print(DEVICE_ID);
-  Serial.print(F("->A")); Serial.print(anchorId);
-  Serial.print(F(" #")); Serial.print(rangeSeq);
-  Serial.print(F("  d="));  Serial.print(dist, 3); Serial.print(F("m"));
-  Serial.print(F("  RX="));  Serial.print(diag.rx_power, 1);
-  Serial.print(F("  FP="));  Serial.print(diag.fp_power, 1);
-  Serial.print(F("  Q="));   Serial.print(diag.quality, 1);
-  Serial.print(F("  SN="));  Serial.print(diag.std_noise);
-  Serial.print(F("  A1="));  Serial.print(diag.fp_ampl1);
-  Serial.print(F("  A2="));  Serial.print(diag.fp_ampl2);
-  Serial.print(F("  A3="));  Serial.print(diag.fp_ampl3);
-  Serial.print(F("  PACC=")); Serial.print(diag.rxpacc);
-  Serial.print(F("  RT="));  Serial.print((long)roundTrip);
-  Serial.print(F("  RD="));  Serial.print((long)replyDelay);
-  if (nlos) Serial.print(F("  NLOS?"));
-  Serial.println();
+  SP(F("T")); SP(DEVICE_ID);
+  SP(F("->A")); SP(anchorId);
+  SP(F(" #")); SP(rangeSeq);
+  SP(F("  d="));  SP2(dist, 3); SP(F("m"));
+  SP(F("  RX="));  SP2(diag.rx_power, 1);
+  SP(F("  FP="));  SP2(diag.fp_power, 1);
+  SP(F("  Q="));   SP2(diag.quality, 1);
+  SP(F("  SN="));  SP(diag.std_noise);
+  SP(F("  A1="));  SP(diag.fp_ampl1);
+  SP(F("  A2="));  SP(diag.fp_ampl2);
+  SP(F("  A3="));  SP(diag.fp_ampl3);
+  SP(F("  PACC=")); SP(diag.rxpacc);
+  SP(F("  RT="));  SP((long)roundTrip);
+  SP(F("  RD="));  SP((long)replyDelay);
+  if (nlos) SP(F("  NLOS?"));
+  SPLN();
 }

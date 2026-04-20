@@ -102,7 +102,7 @@ void startReceiver() {
 }
 
 void dwmSoftReset() {
-  Serial.println(F("[RST] DWM soft-reset..."));
+  SPLN(F("[RST] DWM soft-reset..."));
   pinMode(PIN_RST, OUTPUT);
   digitalWrite(PIN_RST, LOW);
   delay(2);
@@ -134,7 +134,7 @@ void dwmSoftReset() {
   DW1000.writeBytes(SYS_MASK, NO_SUB, zeros, 4);
 
   startReceiver();
-  Serial.println(F("[RST] Done. Listening..."));
+  SPLN(F("[RST] Done. Listening..."));
 }
 
 RawDiag readRxDiagnostics() {
@@ -170,13 +170,13 @@ void setAntennaDelay(uint16_t value) {
   byte buf[2] = { (byte)(value & 0xFF), (byte)((value >> 8) & 0xFF) };
   DW1000.writeBytes(0x18, 0x00, buf, 2);
   DW1000.writeBytes(0x2E, 0x1804, buf, 2);
-  Serial.print(F("[CMD] Antenna delay set to: "));
-  Serial.println(value);
+  SP(F("[CMD] Antenna delay set to: "));
+  SPLN(value);
 }
 
 void processCommand(const char* cmd) {
-  Serial.print(F("[CMD] Received: "));
-  Serial.println(cmd);
+  SP(F("[CMD] Received: "));
+  SPLN(cmd);
 
   if (strncmp(cmd, "AD:", 3) == 0) {
     uint16_t val = (uint16_t)atoi(cmd + 3);
@@ -189,8 +189,8 @@ void processCommand(const char* cmd) {
     char resp[32];
     snprintf(resp, sizeof(resp), "AD:%u", antennaDelay);
     cmdChar.writeValue((uint8_t*)resp, strlen(resp));
-    Serial.print(F("[CMD] Status: "));
-    Serial.println(resp);
+    SP(F("[CMD] Status: "));
+    SPLN(resp);
   }
 }
 
@@ -243,7 +243,7 @@ void setup() {
   Serial.begin(115200);
   delay(500);
 
-  Serial.println(F("=== UWB Anchor v4 (raw delayed TX) + BLE + CMD  [" DEVICE_NAME "] ==="));
+  SPLN(F("=== UWB Anchor v4 (raw delayed TX) + BLE + CMD  [" DEVICE_NAME "] ==="));
 
   DW1000.begin(PIN_IRQ, PIN_RST);
   DW1000.select(PIN_CS);
@@ -264,7 +264,7 @@ void setup() {
   DW1000.writeBytes(SYS_MASK, NO_SUB, zeros, 4);
 
   if (!BLE.begin()) {
-    Serial.println(F("BLE init failed!"));
+    SPLN(F("BLE init failed!"));
     while (1) delay(1000);
   }
 
@@ -283,7 +283,7 @@ void setup() {
   cmdChar.writeValue((uint8_t*)initStatus, strlen(initStatus));
 
   BLE.advertise();
-  Serial.println(F("BLE advertising. Listening for POLLs...\n"));
+  SPLN(F("BLE advertising. Listening for POLLs...\n"));
   startReceiver();
   lastGoodMs = millis();
 }
@@ -302,9 +302,9 @@ void loop() {
   }
 
   if ((uint32_t)(millis() - lastGoodMs) > WATCHDOG_MS) {
-    Serial.print(F("[WDT] No exchange for "));
-    Serial.print(WATCHDOG_MS);
-    Serial.println(F(" ms -- resetting DWM"));
+    SP(F("[WDT] No exchange for "));
+    SP(WATCHDOG_MS);
+    SPLN(F(" ms -- resetting DWM"));
     dwmSoftReset();
     lastGoodMs = millis();
     return;
@@ -350,7 +350,7 @@ void loop() {
       bool txOk = rawDelayedTransmit(txBuffer, 7, txTime);
 
       if (!txOk) {
-        Serial.println(F("[ERR] Delayed TX failed (HPDWARN or timeout)"));
+        SPLN(F("[ERR] Delayed TX failed (HPDWARN or timeout)"));
         clearStatusAll();
         startReceiver();
         lastGoodMs = millis();
@@ -387,19 +387,19 @@ void loop() {
 
       lastGoodMs = millis();
 
-      Serial.print(F("A")); Serial.print(DEVICE_ID);
-      Serial.print(F("<-T")); Serial.print(tagId);
-      Serial.print(F(" #")); Serial.print(rangeSeq);
-      Serial.print(F("  RX="));   Serial.print(diag.rx_power, 1);
-      Serial.print(F("  FP="));   Serial.print(diag.fp_power, 1);
-      Serial.print(F("  Q="));    Serial.print(diag.quality, 1);
-      Serial.print(F("  SN="));   Serial.print(diag.std_noise);
-      Serial.print(F("  A1="));   Serial.print(diag.fp_ampl1);
-      Serial.print(F("  A2="));   Serial.print(diag.fp_ampl2);
-      Serial.print(F("  A3="));   Serial.print(diag.fp_ampl3);
-      Serial.print(F("  PACC=")); Serial.print(diag.rxpacc);
-      Serial.print(F("  RD="));   Serial.print((long)actualReplyDelay);
-      Serial.println();
+      SP(F("A")); SP(DEVICE_ID);
+      SP(F("<-T")); SP(tagId);
+      SP(F(" #")); SP(rangeSeq);
+      SP(F("  RX="));   SP2(diag.rx_power, 1);
+      SP(F("  FP="));   SP2(diag.fp_power, 1);
+      SP(F("  Q="));    SP2(diag.quality, 1);
+      SP(F("  SN="));   SP(diag.std_noise);
+      SP(F("  A1="));   SP(diag.fp_ampl1);
+      SP(F("  A2="));   SP(diag.fp_ampl2);
+      SP(F("  A3="));   SP(diag.fp_ampl3);
+      SP(F("  PACC=")); SP(diag.rxpacc);
+      SP(F("  RD="));   SP((long)actualReplyDelay);
+      SPLN();
     }
 
     startReceiver();
