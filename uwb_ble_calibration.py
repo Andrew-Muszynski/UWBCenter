@@ -14,10 +14,15 @@ Workflow:
                 corrected position on a 2-D polar map
 
 Requirements:
-    pip install requests scikit-learn numpy pandas matplotlib
+    pip install bleak scikit-learn numpy pandas matplotlib
     (tkinter is part of the Python standard library)
+
+This file is fully self-contained: collection, training, model save/load, and
+inference all live here.  No companion modules or external services required.
 """
 
+import sys
+import types
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog, simpledialog
 import threading
@@ -25,6 +30,9 @@ import time
 import os
 import math
 import pickle
+import asyncio
+import struct
+import csv
 
 import numpy as np
 import pandas as pd
@@ -33,10 +41,10 @@ from pathlib import Path
 from collections import deque
 
 try:
-    import requests
-    HAS_REQUESTS = True
+    from bleak import BleakScanner, BleakClient
+    HAS_BLEAK = True
 except ImportError:
-    HAS_REQUESTS = False
+    HAS_BLEAK = False
 
 from sklearn.model_selection import train_test_split, cross_val_score
 from sklearn.preprocessing import StandardScaler
@@ -57,10 +65,32 @@ from matplotlib.figure import Figure
 
 # ═══════════════════════════════ CONFIGURATION ════════════════════════════════
 
-DASHBOARD_URL  = "http://localhost:5050/api/state"
-POLL_INTERVAL  = 0.5          # seconds between /api/state polls
+POLL_INTERVAL  = 0.5
 DATASET_FILE   = "ble_cal_dataset.csv"
 ANGLE_CHOICES  = ["0", "45", "90", "135", "180", "225", "270", "315"]
+
+# ── Direct-BLE configuration (matches anchor_A1_v3.ino / tag_T1_v3.ino) ──────
+TAG_CHAR_UUID    = "19b10011-e8f2-537e-4f6c-d104768a1214"
+ANCHOR_CHAR_UUID = "19b10012-e8f2-537e-4f6c-d104768a1214"
+CMD_CHAR_UUID    = "19b10013-e8f2-537e-4f6c-d104768a1214"
+
+TAG_NAMES    = [f"T{i}" for i in range(1, 11)]
+ANCHOR_NAMES = [f"A{i}" for i in range(1, 11)]
+ALL_NAMES    = TAG_NAMES + ANCHOR_NAMES
+
+SCAN_TIMEOUT    = 8.0
+RESCAN_INTERVAL = 12.0
+RECONNECT_SEC   = 3.0
+HISTORY_LEN     = 200
+
+# BLE frame layouts (must match the Arduino sketches)
+TAG_FMT     = "<BHfiBiBfffHHHHHHBB"   # 43 bytes
+ANCHOR_FMT  = "<BHfffHHHHHHiBB"        # 33 bytes
+TAG_SIZE    = struct.calcsize(TAG_FMT)
+ANCHOR_SIZE = struct.calcsize(ANCHOR_FMT)
+
+LOG_DIR = Path("logs")
+LOG_DIR.mkdir(exist_ok=True)
 
 # ═══════════════════════════════ FEATURES ═════════════════════════════════════
 
@@ -94,6 +124,77 @@ REQUIRED_TAG_COLS = {
     "quality", "std_noise", "fp_ampl1", "fp_ampl2",
     "fp_ampl3", "cir_power", "rxpacc",
 }
+
+# ═══════════════════════════════ DUAL-PIPELINE ENSEMBLE ══════════════════════
+# Inlined here so the file is self-contained.  Legacy pickles that reference
+# the old `dual_dist_ensemble.DualPipelineEnsemble` import path are remapped
+# to this class via the sys.modules shim below.
+
+class DualPipelineEnsemble:
+    """Routes / blends two distance pipelines (short-range + long-range).
+
+    `X` is aligned to the union of both feature lists; per-model column
+    indices are precomputed at construction time.
+    """
+
+    def __init__(
+        self,
+        model_short,
+        feats_short: list,
+        model_long,
+        feats_long: list,
+        union_feats: list,
+        raw_dist_idx: int,
+        route_threshold_m: float = 0.5,
+        blend: str = "route",
+        weight_short: float = 0.5,
+    ):
+        self.model_short = model_short
+        self.model_long = model_long
+        self.feats_short = list(feats_short)
+        self.feats_long = list(feats_long)
+        self.union_feats = list(union_feats)
+        self.idx_short = [self.union_feats.index(f) for f in self.feats_short]
+        self.idx_long = [self.union_feats.index(f) for f in self.feats_long]
+        self.raw_dist_idx = int(raw_dist_idx)
+        self.route_threshold_m = float(route_threshold_m)
+        self.blend = blend
+        self.weight_short = float(weight_short)
+
+    def _predict_pair(self, X: np.ndarray):
+        Xs = X[:, self.idx_short]
+        Xl = X[:, self.idx_long]
+        return self.model_short.predict(Xs), self.model_long.predict(Xl)
+
+    def predict(self, X) -> np.ndarray:
+        X = np.asarray(X, dtype=float)
+        if X.ndim == 1:
+            X = X.reshape(1, -1)
+        ps, pl = self._predict_pair(X)
+        if self.blend == "route":
+            raw = X[:, self.raw_dist_idx]
+            return np.where(raw < self.route_threshold_m, ps, pl)
+        if self.blend == "weighted":
+            w = self.weight_short
+            return w * ps + (1.0 - w) * pl
+        raise ValueError(f"Unknown blend mode: {self.blend!r}")
+
+    def __repr__(self) -> str:
+        return (
+            "DualPipelineEnsemble("
+            f"blend={self.blend!r}, threshold={self.route_threshold_m}, "
+            f"feats_short={len(self.feats_short)}, feats_long={len(self.feats_long)}, "
+            f"union={len(self.union_feats)})"
+        )
+
+
+# Make legacy pickles that reference `dual_dist_ensemble.DualPipelineEnsemble`
+# resolve to the inlined class above, so old combined-ensemble .pkl files
+# continue to load even though the standalone module no longer exists.
+_dde_shim = types.ModuleType("dual_dist_ensemble")
+_dde_shim.DualPipelineEnsemble = DualPipelineEnsemble
+sys.modules.setdefault("dual_dist_ensemble", _dde_shim)
+
 
 # ═══════════════════════════════ HELPERS ══════════════════════════════════════
 
@@ -151,70 +252,513 @@ def safe_build_X(df: pd.DataFrame, features: list) -> np.ndarray:
     return X
 
 
-# ═══════════════════════════════ BLE POLLER ═══════════════════════════════════
+# ═══════════════════════════════ BLE FRAME UNPACKERS ═════════════════════════
 
-class BLEPoller:
-    """
-    Background thread that polls /api/state and dispatches only NEW tag packets
-    (deduplicated by seq number) to registered callbacks.
-    """
+def unpack_tag(data: bytes) -> dict | None:
+    """Parse a 43-byte TagFrame from the v3 firmware."""
+    if len(data) < TAG_SIZE:
+        return None
+    v = struct.unpack(TAG_FMT, data[:TAG_SIZE])
+    round_trip  = (v[4]  << 32) | (v[3]  & 0xFFFFFFFF)
+    reply_delay = (v[6]  << 32) | (v[5]  & 0xFFFFFFFF)
+    return {
+        "anchor_id":    v[0],
+        "seq":          v[1],
+        "distance_m":   round(v[2], 3),
+        "round_trip":   round_trip,
+        "reply_delay":  reply_delay,
+        "rx_power":     round(v[7], 1),
+        "fp_power":     round(v[8], 1),
+        "fp_rx_ratio":  round(v[8] - v[7], 1),
+        "quality":      round(v[9], 2),
+        "std_noise":    v[10],
+        "fp_ampl1":     v[11],
+        "fp_ampl2":     v[12],
+        "fp_ampl3":     v[13],
+        "cir_power":    v[14],
+        "rxpacc":       v[15],
+        "flags":        v[16],
+        "anchor_count": v[17],
+        "nlos_suspect": bool(v[16] & 0x02),
+    }
+
+
+def unpack_anchor(data: bytes) -> dict | None:
+    """Parse a 33-byte AnchorFrame from the v3 firmware."""
+    if len(data) < ANCHOR_SIZE:
+        return None
+    v = struct.unpack(ANCHOR_FMT, data[:ANCHOR_SIZE])
+    reply_delay = (v[12] << 32) | (v[11] & 0xFFFFFFFF)
+    return {
+        "tag_id":       v[0],
+        "seq":          v[1],
+        "rx_power":     round(v[2], 1),
+        "fp_power":     round(v[3], 1),
+        "fp_rx_ratio":  round(v[3] - v[2], 1),
+        "quality":      round(v[4], 2),
+        "std_noise":    v[5],
+        "fp_ampl1":     v[6],
+        "fp_ampl2":     v[7],
+        "fp_ampl3":     v[8],
+        "cir_power":    v[9],
+        "rxpacc":       v[10],
+        "reply_delay":  reply_delay,
+        "flags":        v[13],
+    }
+
+
+# ═══════════════════════════════ CSV LOGGING ═════════════════════════════════
+# Mirrors uwb_dashboard.py: per-antenna-delay subfolders, separate tag/anchor CSVs.
+
+TAG_HEADER = [
+    "timestamp", "device", "anchor_id", "seq", "distance_m",
+    "rx_power", "fp_power", "fp_rx_ratio", "quality",
+    "round_trip", "reply_delay",
+    "std_noise", "fp_ampl1", "fp_ampl2", "fp_ampl3",
+    "cir_power", "rxpacc", "flags", "anchor_count", "nlos_suspect",
+]
+ANCHOR_HEADER = [
+    "timestamp", "device", "tag_id", "seq",
+    "rx_power", "fp_power", "fp_rx_ratio", "quality",
+    "std_noise", "fp_ampl1", "fp_ampl2", "fp_ampl3",
+    "cir_power", "rxpacc", "reply_delay", "flags",
+]
+
+
+class StreamLogger:
+    """Owns the two open CSV writers for the current antenna-delay subfolder."""
 
     def __init__(self):
-        self._callbacks  = []
-        self._running    = False
-        self._thread     = None
-        self._max_seq    = {}     # device_name → highest seq seen
+        self._lock = threading.Lock()
+        self.antenna_delay = 0
+        self.tag_path: Path | None = None
+        self.anchor_path: Path | None = None
+        self._tag_file = None
+        self._anchor_file = None
+        self._tag_writer = None
+        self._anchor_writer = None
+        self.rotate(0)
 
+    def _subdir(self) -> Path:
+        ad = self.antenna_delay
+        sub = LOG_DIR / (f"AD_{ad}" if ad else "AD_unknown")
+        sub.mkdir(parents=True, exist_ok=True)
+        return sub
+
+    def rotate(self, antenna_delay: int):
+        with self._lock:
+            self.antenna_delay = int(antenna_delay)
+            self._close_locked()
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            sub = self._subdir()
+            self.tag_path    = sub / f"tag_{ts}.csv"
+            self.anchor_path = sub / f"anchor_{ts}.csv"
+            self._tag_file    = open(self.tag_path, "w", newline="")
+            self._anchor_file = open(self.anchor_path, "w", newline="")
+            self._tag_writer    = csv.writer(self._tag_file)
+            self._anchor_writer = csv.writer(self._anchor_file)
+            self._tag_writer.writerow(TAG_HEADER)
+            self._anchor_writer.writerow(ANCHOR_HEADER)
+
+    def _close_locked(self):
+        for f in (self._tag_file, self._anchor_file):
+            try:
+                if f is not None:
+                    f.close()
+            except Exception:
+                pass
+        self._tag_file = self._anchor_file = None
+        self._tag_writer = self._anchor_writer = None
+
+    def close(self):
+        with self._lock:
+            self._close_locked()
+
+    def log_tag(self, name: str, pkt: dict):
+        with self._lock:
+            if self._tag_writer is None:
+                return
+            self._tag_writer.writerow([
+                pkt.get("_ts", datetime.now().isoformat(timespec="milliseconds")),
+                name, pkt["anchor_id"], pkt["seq"], pkt["distance_m"],
+                pkt["rx_power"], pkt["fp_power"], pkt["fp_rx_ratio"],
+                pkt["quality"], pkt["round_trip"], pkt["reply_delay"],
+                pkt["std_noise"], pkt["fp_ampl1"], pkt["fp_ampl2"], pkt["fp_ampl3"],
+                pkt["cir_power"], pkt["rxpacc"], pkt["flags"],
+                pkt["anchor_count"], pkt["nlos_suspect"],
+            ])
+            self._tag_file.flush()
+
+    def log_anchor(self, name: str, pkt: dict):
+        with self._lock:
+            if self._anchor_writer is None:
+                return
+            self._anchor_writer.writerow([
+                pkt.get("_ts", datetime.now().isoformat(timespec="milliseconds")),
+                name, pkt["tag_id"], pkt["seq"],
+                pkt["rx_power"], pkt["fp_power"], pkt["fp_rx_ratio"],
+                pkt["quality"], pkt["std_noise"], pkt["fp_ampl1"],
+                pkt["fp_ampl2"], pkt["fp_ampl3"], pkt["cir_power"],
+                pkt["rxpacc"], pkt["reply_delay"], pkt["flags"],
+            ])
+            self._anchor_file.flush()
+
+
+# ═══════════════════════════════ BLE ENGINE ═══════════════════════════════════
+
+class BLEEngine:
+    """Self-contained BLE engine.  Runs an asyncio loop on a background thread,
+    scans for T*/A* devices, connects to each, subscribes to the v3
+    notification characteristic, and dispatches tag packets to subscribed
+    callbacks.  Also accepts AD/RI/ST commands for any connected device.
+
+    Public surface (thread-safe; call from the Tk main thread):
+        engine.start()
+        engine.stop()
+        engine.subscribe(cb)            cb(device_name: str, pkt: dict)
+        engine.send_command(name, cmd)  cmd is "AD:NNNN" / "RI:NNNN" / "ST"
+        engine.send_command_all(cmd)
+        engine.snapshot()               -> {name: device_state_dict}
+        engine.last_status              -> str
+        engine.antenna_delay            -> int (most recently observed AD)
+    """
+
+    def __init__(self, logger: StreamLogger):
+        self._loop: asyncio.AbstractEventLoop | None = None
+        self._loop_thread: threading.Thread | None = None
+        self._stop_evt: asyncio.Event | None = None
+        self._scan_task = None
+        self._main_task: asyncio.Task | None = None
+        self._main_future = None
+        self._handlers: dict[str, asyncio.Task] = {}
+        self._clients: dict[str, BleakClient] = {}
+        self._callbacks: list = []
+        self._lock = threading.Lock()
+        self._devices: dict[str, dict] = {}
+        self._max_seq: dict[str, int] = {}
+        self.last_status = "idle"
+        self.antenna_delay = 0
+        self.logger = logger
+        self._running = False
+
+    # ── thread-safe entry points ────────────────────────────────────────────
     def subscribe(self, cb):
         self._callbacks.append(cb)
 
-    def start(self):
-        if self._running:
-            return
-        self._running = True
-        self._thread  = threading.Thread(target=self._loop, daemon=True)
-        self._thread.start()
-
-    def stop(self):
-        self._running = False
-
     def reset_seq(self):
-        """Call before a new collection session to replay any buffered packets."""
         self._max_seq.clear()
 
-    def _loop(self):
-        while self._running:
-            self._poll()
-            time.sleep(POLL_INTERVAL)
-
-    def _poll(self):
-        if not HAS_REQUESTS:
+    def start(self):
+        if self._running or not HAS_BLEAK:
             return
+        self._running = True
+        self._loop = asyncio.new_event_loop()
+        self._loop_thread = threading.Thread(
+            target=self._loop_runner, daemon=True, name="BLEEngineLoop")
+        self._loop_thread.start()
+        # Schedule the BLE main task on the new loop and keep a handle so
+        # shutdown can cancel + await it cleanly.
+        fut = asyncio.run_coroutine_threadsafe(self._ble_main(), self._loop)
+        self._main_future = fut
+
+    def stop(self):
+        if not self._running:
+            return
+        self._running = False
+        loop = self._loop
+        if loop and loop.is_running():
+            # Run the async shutdown on the BLE loop and block briefly so
+            # the in-flight scan/connects unwind before we tear the loop
+            # down.  This avoids the "Task was destroyed but it is pending"
+            # warning that fires when _ble_main is parked inside
+            # BleakScanner.discover() at exit.
+            try:
+                fut = asyncio.run_coroutine_threadsafe(self._async_stop(), loop)
+                fut.result(timeout=10.0)
+            except Exception:
+                pass
+            loop.call_soon_threadsafe(loop.stop)
+        if self._loop_thread and self._loop_thread.is_alive():
+            self._loop_thread.join(timeout=2.0)
+
+    def snapshot(self) -> dict:
+        with self._lock:
+            return {n: dict(s) for n, s in self._devices.items()}
+
+    def send_command(self, device: str, cmd: str) -> bool:
+        if not (self._loop and self._loop.is_running()):
+            return False
+        asyncio.run_coroutine_threadsafe(self._send_one(device, cmd), self._loop)
+        return True
+
+    def send_command_all(self, cmd: str) -> int:
+        names = [n for n, s in self.snapshot().items() if s.get("connected")]
+        for n in names:
+            self.send_command(n, cmd)
+        return len(names)
+
+    # ── internal asyncio plumbing ───────────────────────────────────────────
+    def _loop_runner(self):
+        asyncio.set_event_loop(self._loop)
         try:
-            resp = requests.get(DASHBOARD_URL, timeout=3)
-            data = resp.json()
-        except Exception:
-            return
+            self._loop.run_forever()
+        finally:
+            try:
+                self._loop.close()
+            except Exception:
+                pass
 
-        for name, dev in data.get("devices", {}).items():
-            if dev.get("type") != "tag":
+    async def _async_stop(self):
+        self.last_status = "stopping"
+        if self._stop_evt:
+            self._stop_evt.set()
+        # Cancel per-device handlers and wait for them to settle so they
+        # don't get garbage-collected while still pending.
+        handlers = [t for t in self._handlers.values() if not t.done()]
+        for t in handlers:
+            t.cancel()
+        if handlers:
+            await asyncio.gather(*handlers, return_exceptions=True)
+        # Cancel _ble_main if it's still parked inside a discover() call,
+        # then await it so the loop can stop without leaking the task.
+        main_task = getattr(self, "_main_task", None)
+        if main_task is not None and not main_task.done():
+            main_task.cancel()
+            try:
+                await main_task
+            except (asyncio.CancelledError, Exception):
+                pass
+        for c in list(self._clients.values()):
+            try:
+                await c.disconnect()
+            except Exception:
+                pass
+
+    async def _ble_main(self):
+        self._stop_evt = asyncio.Event()
+        self._main_task = asyncio.current_task()
+        self.last_status = "scanning"
+        while not self._stop_evt.is_set():
+            try:
+                found = await BleakScanner.discover(timeout=SCAN_TIMEOUT)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                self.last_status = f"scan error: {e}"
+                try:
+                    await asyncio.wait_for(self._stop_evt.wait(), timeout=RESCAN_INTERVAL)
+                except asyncio.TimeoutError:
+                    pass
                 continue
-            max_seen = self._max_seq.get(name, -1)
-            new_pkts = sorted(
-                [p for p in dev.get("history", []) if p.get("seq", -1) > max_seen],
-                key=lambda p: p.get("seq", 0),
-            )
-            for pkt in new_pkts:
-                s = pkt.get("seq", 0)
-                if s > max_seen:
-                    max_seen = s
-                for cb in self._callbacks:
+
+            targets = sorted(
+                [d for d in found if (d.name or "") in ALL_NAMES],
+                key=lambda d: d.name or "")
+            if targets:
+                self.last_status = "visible: " + ", ".join(d.name for d in targets)
+            else:
+                self.last_status = "no UWB devices visible"
+
+            for dev in targets:
+                name = dev.name
+                t = self._handlers.get(name)
+                if t is None or t.done():
+                    handler = (self._handle_tag if name in TAG_NAMES
+                               else self._handle_anchor)
+                    self._handlers[name] = asyncio.create_task(handler(dev))
+
+            try:
+                await asyncio.wait_for(self._stop_evt.wait(), timeout=RESCAN_INTERVAL)
+            except asyncio.TimeoutError:
+                pass
+
+        self.last_status = "stopped"
+
+    def _init_state(self, name: str, addr: str, dev_type: str):
+        with self._lock:
+            if name not in self._devices:
+                self._devices[name] = {
+                    "type":         dev_type,
+                    "connected":    False,
+                    "addr":         addr,
+                    "connect_time": "",
+                    "packet_count": 0,
+                    "settings":     {},
+                    "last_seq":     -1,
+                }
+            self._devices[name]["addr"] = addr
+
+    def _set_connected(self, name: str, addr: str, connected: bool):
+        with self._lock:
+            d = self._devices.get(name)
+            if d is None:
+                return
+            d["connected"] = connected
+            d["addr"] = addr
+            if connected:
+                d["connect_time"] = datetime.now().isoformat(timespec="seconds")
+
+    def _record_settings(self, name: str, settings_str: str):
+        old_ad = self.antenna_delay
+        with self._lock:
+            d = self._devices.get(name)
+            if d is None:
+                return
+            for part in settings_str.strip().split():
+                if part.startswith("AD:"):
                     try:
-                        cb(name, pkt)
+                        ad_val = int(part[3:])
+                        d["settings"]["antenna_delay"] = ad_val
+                        self.antenna_delay = ad_val
+                    except ValueError:
+                        pass
+                elif part.startswith("RI:"):
+                    try:
+                        d["settings"]["range_interval"] = int(part[3:])
+                    except ValueError:
+                        pass
+        if self.antenna_delay != old_ad:
+            try:
+                self.logger.rotate(self.antenna_delay)
+            except Exception as e:
+                self.last_status = f"log rotate err: {e}"
+
+    async def _refresh_device(self, name: str, current):
+        try:
+            fresh = await BleakScanner.find_device_by_name(name, timeout=6.0)
+            if fresh:
+                return fresh
+        except Exception:
+            pass
+        return current
+
+    def _dispatch_tag_to_callbacks(self, name: str, pkt: dict):
+        max_seen = self._max_seq.get(name, -1)
+        if pkt["seq"] <= max_seen:
+            return
+        self._max_seq[name] = pkt["seq"]
+        for cb in self._callbacks:
+            try:
+                cb(name, pkt)
+            except Exception:
+                pass
+
+    async def _handle_tag(self, ble_device):
+        name = ble_device.name
+        current = ble_device
+        self._init_state(name, current.address, "tag")
+        while not (self._stop_evt and self._stop_evt.is_set()):
+            try:
+                async with BleakClient(current, timeout=15.0) as client:
+                    self._clients[name] = client
+                    self._set_connected(name, current.address, True)
+                    self.last_status = f"connected: {name}"
+
+                    def on_notify(_, data):
+                        pkt = unpack_tag(data)
+                        if pkt is None:
+                            return
+                        pkt["_ts"] = datetime.now().isoformat(timespec="milliseconds")
+                        with self._lock:
+                            d = self._devices.get(name)
+                            if d is not None:
+                                d["packet_count"] += 1
+                                d["last_seq"] = pkt["seq"]
+                        try:
+                            self.logger.log_tag(name, pkt)
+                        except Exception:
+                            pass
+                        self._dispatch_tag_to_callbacks(name, pkt)
+
+                    await client.start_notify(TAG_CHAR_UUID, on_notify)
+
+                    # Initial settings query so we know the AD value
+                    try:
+                        await client.write_gatt_char(CMD_CHAR_UUID, b"ST")
+                        await asyncio.sleep(0.3)
+                        resp = await client.read_gatt_char(CMD_CHAR_UUID)
+                        self._record_settings(
+                            name, resp.decode("utf-8", errors="replace"))
                     except Exception:
                         pass
-            if new_pkts:
-                self._max_seq[name] = max_seen
+
+                    while client.is_connected and not (self._stop_evt and self._stop_evt.is_set()):
+                        await asyncio.sleep(0.5)
+            except Exception as e:
+                self.last_status = f"{name}: {e}"
+            finally:
+                self._clients.pop(name, None)
+                self._set_connected(name, current.address, False)
+            if self._stop_evt and self._stop_evt.is_set():
+                break
+            await asyncio.sleep(RECONNECT_SEC)
+            current = await self._refresh_device(name, current)
+
+    async def _handle_anchor(self, ble_device):
+        name = ble_device.name
+        current = ble_device
+        self._init_state(name, current.address, "anchor")
+        while not (self._stop_evt and self._stop_evt.is_set()):
+            try:
+                async with BleakClient(current, timeout=15.0) as client:
+                    self._clients[name] = client
+                    self._set_connected(name, current.address, True)
+                    self.last_status = f"connected: {name}"
+
+                    def on_notify(_, data):
+                        pkt = unpack_anchor(data)
+                        if pkt is None:
+                            return
+                        pkt["_ts"] = datetime.now().isoformat(timespec="milliseconds")
+                        with self._lock:
+                            d = self._devices.get(name)
+                            if d is not None:
+                                d["packet_count"] += 1
+                                d["last_seq"] = pkt["seq"]
+                        try:
+                            self.logger.log_anchor(name, pkt)
+                        except Exception:
+                            pass
+                        # Anchor frames don't drive calibration callbacks (no
+                        # round_trip) — only tags do.
+
+                    await client.start_notify(ANCHOR_CHAR_UUID, on_notify)
+
+                    try:
+                        await client.write_gatt_char(CMD_CHAR_UUID, b"ST")
+                        await asyncio.sleep(0.3)
+                        resp = await client.read_gatt_char(CMD_CHAR_UUID)
+                        self._record_settings(
+                            name, resp.decode("utf-8", errors="replace"))
+                    except Exception:
+                        pass
+
+                    while client.is_connected and not (self._stop_evt and self._stop_evt.is_set()):
+                        await asyncio.sleep(0.5)
+            except Exception as e:
+                self.last_status = f"{name}: {e}"
+            finally:
+                self._clients.pop(name, None)
+                self._set_connected(name, current.address, False)
+            if self._stop_evt and self._stop_evt.is_set():
+                break
+            await asyncio.sleep(RECONNECT_SEC)
+            current = await self._refresh_device(name, current)
+
+    async def _send_one(self, device: str, cmd: str):
+        client = self._clients.get(device)
+        if client is None or not client.is_connected:
+            self.last_status = f"send {device} {cmd}: not connected"
+            return
+        try:
+            await client.write_gatt_char(CMD_CHAR_UUID, cmd.encode("utf-8"))
+            await asyncio.sleep(0.3)
+            resp = await client.read_gatt_char(CMD_CHAR_UUID)
+            resp_str = resp.decode("utf-8", errors="replace")
+            self._record_settings(device, resp_str)
+            self.last_status = f"{device} ← {cmd}  → {resp_str.strip()}"
+        except Exception as e:
+            self.last_status = f"{device} send err: {e}"
 
 
 # ═══════════════════════════════ MAIN APP ═════════════════════════════════════
@@ -251,17 +795,28 @@ class UWBBLECalApp:
         # ── live collection ring-buffers ───────────────────────────────────
         self._col_raw_buf  = deque(maxlen=120)
 
-        # ── BLE poller ─────────────────────────────────────────────────────
-        self.poller = BLEPoller()
-        self.poller.subscribe(self._on_packet)
-        self.poller.start()
+        # ── BLE engine (direct bleak, replaces the dashboard sidecar) ──────
+        self.logger = StreamLogger()
+        self.engine = BLEEngine(self.logger)
+        self.engine.subscribe(self._on_packet)
+        # Backwards-compatible alias for any older code paths
+        self.poller = self.engine
+        if HAS_BLEAK:
+            self.engine.start()
+        else:
+            print("[!] bleak not installed — BLE engine disabled.")
 
         self._build_ui()
         self._load_dataset()
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+        self.root.after(500, self._tick_connection_panel)
 
     # ══════════════════════════════ UI CONSTRUCTION ════════════════════════
 
     def _build_ui(self):
+        # Always-visible connection panel above the notebook
+        self._build_connection_panel()
+
         nb = ttk.Notebook(self.root)
         nb.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
         self.nb = nb
@@ -284,22 +839,151 @@ class UWBBLECalApp:
         self._build_train_tab()
         self._build_infer_tab()
 
+    def _build_connection_panel(self):
+        cf = ttk.LabelFrame(self.root, text="BLE Connection", padding=8)
+        cf.pack(fill=tk.X, padx=8, pady=(8, 0))
+
+        # Row 1: scan status + per-device dots
+        r1 = ttk.Frame(cf); r1.pack(fill=tk.X)
+        self.scan_status_lbl = ttk.Label(
+            r1, text="(starting)", foreground="gray", width=42, anchor=tk.W)
+        self.scan_status_lbl.pack(side=tk.LEFT)
+
+        self.device_dot_lbls = {}
+        for name in ("T1", "A1"):
+            tag = ttk.Label(r1, text=f"●  {name}", foreground="gray",
+                            font=("TkDefaultFont", 12, "bold"))
+            tag.pack(side=tk.LEFT, padx=(16, 4))
+            self.device_dot_lbls[name] = tag
+        self.device_pkt_lbl = ttk.Label(r1, text="", foreground="gray", anchor=tk.W)
+        self.device_pkt_lbl.pack(side=tk.LEFT, padx=(20, 0))
+
+        # Row 2: AD entry + push controls
+        r2 = ttk.Frame(cf); r2.pack(fill=tk.X, pady=(8, 0))
+        ttk.Label(r2, text="Antenna delay:").pack(side=tk.LEFT)
+        self.ad_var = tk.StringVar(value="0")
+        ttk.Entry(r2, textvariable=self.ad_var, width=8
+                 ).pack(side=tk.LEFT, padx=(4, 6))
+        ttk.Label(r2, text="Target:").pack(side=tk.LEFT, padx=(8, 4))
+        self.ad_target_var = tk.StringVar(value="ALL")
+        ttk.Combobox(r2, textvariable=self.ad_target_var, width=8,
+                     state="readonly",
+                     values=["ALL", "T1", "A1"]).pack(side=tk.LEFT)
+        ttk.Button(r2, text="Push", command=self._push_antenna_delay
+                  ).pack(side=tk.LEFT, padx=(8, 4))
+        ttk.Button(r2, text="Send AD:0 (raw mode)",
+                   command=lambda: self._push_ad_value(0, target="ALL")
+                  ).pack(side=tk.LEFT, padx=(4, 0))
+        ttk.Button(r2, text="Query (ST)", command=self._push_st
+                  ).pack(side=tk.LEFT, padx=(8, 0))
+        ttk.Button(r2, text="Diagnose…", command=self._diagnose_connection
+                  ).pack(side=tk.LEFT, padx=(8, 0))
+        self.engine_status_lbl = ttk.Label(r2, text="", foreground="gray")
+        self.engine_status_lbl.pack(side=tk.LEFT, padx=(16, 0))
+
+    def _tick_connection_panel(self):
+        try:
+            snap = self.engine.snapshot()
+            ad = self.engine.antenna_delay
+            self.scan_status_lbl.configure(
+                text=f"{self.engine.last_status}    AD={ad}",
+                foreground=("green" if any(d["connected"] for d in snap.values())
+                            else "gray"))
+            packet_lines = []
+            for name, lbl in self.device_dot_lbls.items():
+                d = snap.get(name)
+                if d is None:
+                    lbl.configure(foreground="gray")
+                    continue
+                lbl.configure(foreground=("#22aa55" if d["connected"] else "#cc4444"))
+                packet_lines.append(f"{name}: {d['packet_count']} pkts")
+            self.device_pkt_lbl.configure(text="    ".join(packet_lines))
+            self.engine_status_lbl.configure(
+                text=self.engine.last_status[:80] if self.engine.last_status else "")
+        finally:
+            self.root.after(500, self._tick_connection_panel)
+
+    def _push_antenna_delay(self):
+        try:
+            ad = int(self.ad_var.get())
+        except ValueError as e:
+            messagebox.showerror("Bad AD", str(e))
+            return
+        if not 0 <= ad <= 65535:
+            messagebox.showerror("Bad AD", "AD must be 0..65535")
+            return
+        self._push_ad_value(ad, target=self.ad_target_var.get())
+
+    def _push_ad_value(self, ad: int, target: str = "ALL"):
+        cmd = f"AD:{int(ad)}"
+        if target == "ALL":
+            n = self.engine.send_command_all(cmd)
+            self.engine_status_lbl.configure(
+                text=f"queued {cmd} → {n} device(s)", foreground="#22aa55")
+        else:
+            ok = self.engine.send_command(target, cmd)
+            self.engine_status_lbl.configure(
+                text=f"queued {cmd} → {target}" if ok else f"queue failed",
+                foreground=("#22aa55" if ok else "#cc4444"))
+        self.ad_var.set(str(int(ad)))
+
+    def _push_st(self):
+        n = self.engine.send_command_all("ST")
+        self.engine_status_lbl.configure(
+            text=f"queued ST → {n} device(s)", foreground="gray")
+
+    def _diagnose_connection(self):
+        """Pop up a one-shot snapshot of BLE engine + adapter state."""
+        snap = self.engine.snapshot()
+        ad = self.engine.antenna_delay
+        lines = [
+            f"BLE engine status : {self.engine.last_status or '(idle)'}",
+            f"Current antenna δ : AD={ad}",
+            f"Devices known     : {len(snap)}",
+            "",
+        ]
+        if snap:
+            lines.append(f"  {'name':<6} {'type':<7} {'state':<10} {'packets':>8}  {'last_seq':>9}  addr")
+            for name, d in sorted(snap.items()):
+                state = "CONNECTED" if d["connected"] else "disconnected"
+                lines.append(
+                    f"  {name:<6} {d['type']:<7} {state:<10} "
+                    f"{d['packet_count']:>8}  {d['last_seq']:>9}  {d['addr'] or '?'}")
+        else:
+            lines.append("  (no devices discovered yet — scan still in progress)")
+
+        lines.append("")
+        lines.append("BLE adapter is owned exclusively by this app — make sure no")
+        lines.append("other process (e.g. an old dashboard sidecar) is bound to it.")
+
+        win = tk.Toplevel(self.root)
+        win.title("BLE Diagnostics")
+        win.geometry("640x340")
+        txt = tk.Text(win, font=("Menlo", 10), wrap=tk.NONE,
+                      bg="#1a1a2e", fg="#c8d0e0", insertbackground="#c8d0e0")
+        txt.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
+        txt.insert("1.0", "\n".join(lines))
+        txt.config(state=tk.DISABLED)
+        ttk.Button(win, text="Close", command=win.destroy).pack(pady=(0, 8))
+
+    def _on_close(self):
+        try:
+            self.engine.stop()
+        except Exception:
+            pass
+        try:
+            self.logger.close()
+        except Exception:
+            pass
+        try:
+            self.root.destroy()
+        except Exception:
+            pass
+
     # ── Tab 1: Collect ─────────────────────────────────────────────────────
 
     def _build_collect_tab(self):
         t = self.t_collect
-
-        # Dashboard connection
-        sf = ttk.LabelFrame(t, text="Dashboard Connection", padding=8)
-        sf.pack(fill=tk.X, padx=10, pady=(10, 4))
-        sr = ttk.Frame(sf); sr.pack(fill=tk.X)
-        ttk.Label(sr, text="URL:").pack(side=tk.LEFT, padx=(0, 4))
-        self.url_var = tk.StringVar(value=DASHBOARD_URL)
-        ttk.Entry(sr, textvariable=self.url_var, width=42).pack(side=tk.LEFT, padx=(0, 8))
-        ttk.Button(sr, text="Test Connection",
-                   command=self._test_connection).pack(side=tk.LEFT, padx=(0, 10))
-        self.conn_lbl = ttk.Label(sr, text="Unknown", foreground="gray")
-        self.conn_lbl.pack(side=tk.LEFT)
 
         # Session config
         cf = ttk.LabelFrame(t, text="Session Configuration", padding=8)
@@ -362,9 +1046,10 @@ class UWBBLECalApp:
         ttk.Label(info, wraplength=900,
             text=(
                 "Select one or more tag CSV files from logs/.  "
-                "Each file will be labelled with the true distance and angle you enter.  "
-                "If 'Ask per file' is checked you will be prompted for each file individually, "
-                "which is useful when a single run contains only one configuration."
+                "If a file already has a populated 'true_dist_m' column (multi-distance session), "
+                "those per-row labels are preserved and no prompt is shown.  "
+                "Otherwise the defaults below are used — or, if 'Ask per file' is checked, "
+                "you will be prompted for each file individually."
             )).pack(anchor=tk.W)
 
         dr = ttk.Frame(info); dr.pack(fill=tk.X, pady=6)
@@ -432,7 +1117,9 @@ class UWBBLECalApp:
 
         sf = ttk.LabelFrame(t, text="Summary by Distance × Angle", padding=6)
         sf.pack(fill=tk.X, padx=10, pady=(0, 8))
-        self.ds_sum = tk.Text(sf, height=8, font=("Consolas", 9), state=tk.DISABLED)
+        self.ds_sum = tk.Text(sf, height=8, font=("Consolas", 9),
+                              bg="#1a1a2e", fg="#c8d0e0",
+                              insertbackground="#c8d0e0", state=tk.DISABLED)
         self.ds_sum.pack(fill=tk.X)
 
     # ── Tab 4: Train ────────────────────────────────────────────────────────
@@ -495,6 +1182,8 @@ class UWBBLECalApp:
         rf = ttk.Frame(top)
         rf.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=5, pady=5)
         self.train_results = tk.Text(rf, height=14, font=("Consolas", 9),
+                                     bg="#1a1a2e", fg="#c8d0e0",
+                                     insertbackground="#c8d0e0",
                                      state=tk.DISABLED, wrap=tk.WORD)
         self.train_results.pack(fill=tk.X, pady=(0, 4))
         self._tr_fig    = Figure(figsize=(7, 4), dpi=96)
@@ -507,9 +1196,16 @@ class UWBBLECalApp:
         t = self.t_infer
 
         ctrl = ttk.Frame(t); ctrl.pack(fill=tk.X, padx=10, pady=8)
-        self.infer_btn = ttk.Button(ctrl, text="▶  Start Inference",
+        self.infer_btn = ttk.Button(ctrl, text="▶  Start Inference (live BLE)",
                                     command=self._toggle_inference)
         self.infer_btn.pack(side=tk.LEFT, padx=(0, 12))
+
+        ttk.Button(ctrl, text="▶  Replay loaded dataset",
+                   command=self._replay_dataset
+                   ).pack(side=tk.LEFT, padx=(0, 12))
+        ttk.Button(ctrl, text="▶  Replay CSV file…",
+                   command=self._replay_dataset_file
+                   ).pack(side=tk.LEFT, padx=(0, 16))
 
         ttk.Label(ctrl, text="True dist (m):").pack(side=tk.LEFT)
         self.infer_true_var = tk.StringVar(value="1.00")
@@ -524,6 +1220,8 @@ class UWBBLECalApp:
 
         self.infer_status = ttk.Label(ctrl, text="Inactive", foreground="gray")
         self.infer_status.pack(side=tk.LEFT, padx=14)
+        self._infer_pkt_seen = 0
+        self._infer_started_at = 0.0
 
         # Metric panels
         mf = ttk.Frame(t); mf.pack(fill=tk.X, padx=10, pady=(0, 5))
@@ -550,24 +1248,6 @@ class UWBBLECalApp:
         self._inf_ax_dist = self._inf_fig.add_subplot(122)
         self._inf_canvas  = FigureCanvasTkAgg(self._inf_fig, master=bot)
         self._inf_canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
-
-    # ══════════════════════ CONNECTION TEST ════════════════════════════════
-
-    def _test_connection(self):
-        if not HAS_REQUESTS:
-            self.conn_lbl.config(
-                text="'requests' not installed — run: pip install requests",
-                foreground="red")
-            return
-        try:
-            r    = requests.get(self.url_var.get(), timeout=3)
-            data = r.json()
-            devs = list(data.get("devices", {}).keys())
-            self.conn_lbl.config(
-                text=f"✓  Connected  —  devices: {', '.join(devs) or 'none found'}",
-                foreground="green")
-        except Exception as e:
-            self.conn_lbl.config(text=f"✗  Failed: {e}", foreground="red")
 
     # ══════════════════════ COLLECTION ════════════════════════════════════
 
@@ -677,7 +1357,8 @@ class UWBBLECalApp:
         paths = filedialog.askopenfilenames(
             title="Select tag_*.csv files",
             filetypes=[("CSV", "*.csv"), ("All", "*.*")],
-            initialdir=str(log_dir))
+            initialdir=str(log_dir),
+            parent=self.root)
         if not paths:
             return
 
@@ -704,7 +1385,34 @@ class UWBBLECalApp:
             self._imp_log(f"SKIP  {name} — missing columns: {missing}\n")
             return 0
 
-        # Determine distance/angle label
+        # Multi-distance file: file already has per-row true_dist_m → preserve as-is
+        if "true_dist_m" in df.columns:
+            td_series = pd.to_numeric(df["true_dist_m"], errors="coerce")
+            if td_series.notna().any() and (td_series.fillna(0) != 0).any():
+                df["true_dist_m"] = td_series
+                df = df[df["true_dist_m"].notna()].reset_index(drop=True)
+
+                if "angle_deg" in df.columns and pd.to_numeric(
+                        df["angle_deg"], errors="coerce").notna().any():
+                    df["angle_deg"] = pd.to_numeric(df["angle_deg"], errors="coerce").fillna(0)
+                else:
+                    df["angle_deg"] = float(self.imp_angle_var.get() or 0)
+
+                df["error_m"]    = df["distance_m"] - df["true_dist_m"]
+                df["session_id"] = name
+                if "nlos_suspect" not in df.columns:
+                    df["nlos_suspect"] = False
+
+                df = engineer(df)
+                self.dataset = pd.concat([self.dataset, df], ignore_index=True)
+                summary = ", ".join(
+                    f"{d:g}m×{c}" for d, c in
+                    sorted(df["true_dist_m"].value_counts().items()))
+                self._imp_log(
+                    f"OK    {name}: {len(df)} samples  (multi-distance: {summary})\n")
+                return len(df)
+
+        # Single-label file: prompt or use defaults (existing behaviour)
         if self.imp_ask_each.get():
             td_str = simpledialog.askstring(
                 "True Distance",
@@ -830,11 +1538,25 @@ class UWBBLECalApp:
         if self.dataset.empty:
             messagebox.showinfo("Empty", "No data to export.")
             return
+        LOG_DIR.mkdir(exist_ok=True)
+        default_name = f"dataset_export_{datetime.now():%Y%m%d_%H%M%S}.csv"
         p = filedialog.asksaveasfilename(
-            defaultextension=".csv", filetypes=[("CSV", "*.csv")])
-        if p:
+            defaultextension=".csv", filetypes=[("CSV", "*.csv")],
+            initialdir=str(LOG_DIR.resolve()),
+            initialfile=default_name,
+            parent=self.root)
+        if not p:
+            return
+        try:
             self.dataset.to_csv(p, index=False)
-            messagebox.showinfo("Saved", f"Exported {len(self.dataset)} rows to {p}")
+        except Exception as e:
+            messagebox.showerror("Export failed",
+                f"Could not write CSV:\n{p}\n\n{type(e).__name__}: {e}",
+                parent=self.root)
+            return
+        messagebox.showinfo("Saved",
+            f"Exported {len(self.dataset)} rows to:\n{p}",
+            parent=self.root)
 
     def _clear_dataset(self):
         if messagebox.askyesno("Clear", "Delete ALL calibration data?"):
@@ -873,9 +1595,11 @@ class UWBBLECalApp:
                 f"Need ≥ 20 labelled samples.  Have {len(self.dataset)}.")
             return
 
+        raw_rows = len(self.dataset)
         df = engineer(
             self.dataset.dropna(subset=["distance_m", "true_dist_m"]).copy()
         )
+        dropped = raw_rows - len(df)
         dist_feats  = self._get_feat_list(self.dist_feat_vars)
         angle_feats = self._get_feat_list(self.angle_feat_vars)
 
@@ -885,7 +1609,43 @@ class UWBBLECalApp:
             return
 
         algo = self.dist_algo_var.get()
-        txt  = [f"{'='*58}", "  ML TRAINING REPORT", f"{'='*58}\n"]
+        ALGO_BLURB = {
+            "gradient_boosting":
+                "GradientBoostingRegressor — additive trees, good on small/mid "
+                "tabular sets, captures non-linear bias well",
+            "random_forest":
+                "RandomForestRegressor — bagged trees, robust to noise, slower "
+                "but less hyper-param-sensitive",
+            "ridge_poly3":
+                "Ridge regression on degree-3 polynomial features — smooth, "
+                "interpretable, good when calibration is mostly polynomial",
+        }
+
+        # Per-distance count of usable rows (what the model will actually see)
+        dist_counts = (df["true_dist_m"]
+                       .round(3).value_counts().sort_index().to_dict())
+        per_dist_str = "  ".join(f"{d}m×{n}" for d, n in dist_counts.items())
+
+        txt = [
+            f"{'='*64}",
+            "  ML TRAINING REPORT",
+            f"{'='*64}\n",
+            "INPUTS",
+            f"  Dataset file       : {DATASET_FILE}",
+            f"  Total rows in CSV  : {raw_rows}",
+            f"  Usable rows        : {len(df)}   "
+                f"({dropped} dropped: missing distance_m or true_dist_m)",
+            f"  Distinct distances : {df['true_dist_m'].nunique()}    {per_dist_str}",
+            f"  Distinct angles    : {df['angle_deg'].nunique() if 'angle_deg' in df.columns else 0}",
+            "",
+            "ALGORITHM",
+            f"  Choice  : {algo}",
+            f"  About   : {ALGO_BLURB.get(algo, '')}",
+            f"  Features ({len(dist_feats)}): {', '.join(dist_feats)}",
+            f"  Target   : true_dist_m  (m)",
+            f"  Split    : 80 % train / 20 % test  (random_state=42)",
+            "",
+        ]
 
         # ── Distance corrector ─────────────────────────────────────────────
         try:
@@ -1046,20 +1806,25 @@ class UWBBLECalApp:
             messagebox.showwarning("No Model", "Train a model first.")
             return
         p = filedialog.asksaveasfilename(
-            defaultextension=".pkl", filetypes=[("Pickle", "*.pkl")])
+            defaultextension=".pkl", filetypes=[("Pickle", "*.pkl")],
+            parent=self.root)
         if p:
-            with open(p, "wb") as f:
-                pickle.dump({
-                    "dist_model":  self.dist_model,
-                    "dist_feats":  self.dist_feats,
-                    "angle_model": self.angle_model,
-                    "angle_feats": self.angle_feats,
-                    "meta":        self.model_meta,
-                }, f)
-            messagebox.showinfo("Saved", f"Models saved to {p}")
+            try:
+                with open(p, "wb") as f:
+                    pickle.dump({
+                        "dist_model":  self.dist_model,
+                        "dist_feats":  self.dist_feats,
+                        "angle_model": self.angle_model,
+                        "angle_feats": self.angle_feats,
+                        "meta":        self.model_meta,
+                    }, f)
+                messagebox.showinfo("Saved", f"Models saved to {p}", parent=self.root)
+            except Exception as e:
+                messagebox.showerror("Save error", str(e), parent=self.root)
 
     def _load_models(self):
-        p = filedialog.askopenfilename(filetypes=[("Pickle", "*.pkl")])
+        p = filedialog.askopenfilename(
+            filetypes=[("Pickle", "*.pkl")], parent=self.root)
         if not p:
             return
         try:
@@ -1083,7 +1848,7 @@ class UWBBLECalApp:
     def _toggle_inference(self):
         if self._infer_active:
             self._infer_active = False
-            self.infer_btn.config(text="▶  Start Inference")
+            self.infer_btn.config(text="▶  Start Inference (live BLE)")
             self.infer_status.config(text="Inactive", foreground="gray")
         else:
             if self.dist_model is None:
@@ -1094,13 +1859,42 @@ class UWBBLECalApp:
             self._infer_trail.clear()
             self._inf_raw_hist.clear()
             self._inf_corr_hist.clear()
+            self._infer_pkt_seen = 0
+            self._infer_started_at = time.time()
             self.infer_btn.config(text="■  Stop Inference")
-            self.infer_status.config(text="Active", foreground="green")
+            self.infer_status.config(
+                text="Active — waiting for BLE packets…",
+                foreground="#ffaa00")
+            # If no packets arrive within ~5 s, surface a clearer hint
+            self.root.after(5000, self._check_infer_traffic)
+
+    def _check_infer_traffic(self):
+        if not self._infer_active:
+            return
+        if self._infer_pkt_seen == 0:
+            snap = self.engine.snapshot()
+            connected = [n for n, d in snap.items() if d.get("connected")]
+            if not connected:
+                hint = "No devices connected — check the Connection panel."
+            else:
+                hint = (f"Connected to {','.join(connected)} but no T1 packets "
+                        f"in 5 s — is T1 advertising and ranging?")
+            self.infer_status.config(text=f"Active — {hint}", foreground="#ffaa00")
+        else:
+            self.infer_status.config(
+                text=f"Active — {self._infer_pkt_seen} packets processed",
+                foreground="green")
 
     def _update_inference(self, pkt: dict):
         """Apply the distance corrector (and optional angle classifier) to one packet."""
         if not self._infer_active or self.dist_model is None:
             return
+
+        self._infer_pkt_seen += 1
+        if self._infer_pkt_seen <= 3 or self._infer_pkt_seen % 25 == 0:
+            self.infer_status.config(
+                text=f"Active — {self._infer_pkt_seen} packets processed",
+                foreground="green")
 
         # Build a single-row DataFrame with all raw + engineered features
         row = {k: pkt.get(k, float("nan")) for k in RAW_FEATURES}
@@ -1157,6 +1951,128 @@ class UWBBLECalApp:
             text=f"{angle_est}°" if angle_est is not None else "—")
 
         self._redraw_inference(true_d, true_a, corr, angle_est)
+
+    # ── OFFLINE REPLAY ─────────────────────────────────────────────────────
+    def _replay_dataset(self):
+        """Run the loaded model against the in-memory dataset and visualise."""
+        if self.dist_model is None:
+            messagebox.showwarning("No Model",
+                "Train or load a model first (Train tab → Load…).")
+            return
+        if self.dataset.empty:
+            messagebox.showwarning("No Dataset",
+                "The in-memory dataset is empty. Collect, import, or load a CSV first.")
+            return
+        try:
+            self._run_replay(self.dataset.copy(), label=DATASET_FILE)
+        except Exception as e:
+            messagebox.showerror("Replay error", str(e))
+
+    def _replay_dataset_file(self):
+        """Pick a CSV file and run the loaded model against it."""
+        if self.dist_model is None:
+            messagebox.showwarning("No Model",
+                "Train or load a model first (Train tab → Load…).")
+            return
+        p = filedialog.askopenfilename(
+            title="Pick a labelled CSV (must have true_dist_m + raw UWB cols)",
+            filetypes=[("CSV", "*.csv"), ("All", "*.*")],
+            parent=self.root)
+        if not p:
+            return
+        try:
+            df = pd.read_csv(p)
+            self._run_replay(df, label=os.path.basename(p))
+        except Exception as e:
+            messagebox.showerror("Replay error", str(e))
+
+    def _run_replay(self, df: pd.DataFrame, label: str):
+        # If we were running live, pause it so the panel doesn't fight itself.
+        if self._infer_active:
+            self._infer_active = False
+            self.infer_btn.config(text="▶  Start Inference (live BLE)")
+
+        df = df.replace([np.inf, -np.inf], np.nan)
+        if "true_dist_m" not in df.columns:
+            messagebox.showerror("Replay error",
+                "CSV is missing the true_dist_m column — replay needs labelled rows.")
+            return
+        df = df.dropna(subset=["true_dist_m", "distance_m"]).reset_index(drop=True)
+        if df.empty:
+            messagebox.showwarning("Empty after filter",
+                "No usable rows (need both true_dist_m and distance_m).")
+            return
+        df = engineer(df)
+
+        missing = [f for f in self.dist_feats if f not in df.columns]
+        if missing:
+            messagebox.showerror("Feature mismatch",
+                f"CSV is missing model features: {missing}")
+            return
+
+        X = safe_build_X(df, self.dist_feats)
+        y_true = df["true_dist_m"].astype(float).to_numpy()
+        raw    = df["distance_m"].astype(float).to_numpy()
+        y_pred = np.asarray(self.dist_model.predict(X), dtype=float)
+
+        raw_mae  = float(np.mean(np.abs(raw - y_true)))
+        corr_mae = float(np.mean(np.abs(y_pred - y_true)))
+        improv = (raw_mae - corr_mae) / raw_mae * 100 if raw_mae > 0 else 0.0
+
+        # Update the four metric labels with summary stats
+        self.i_raw_lbl.config(text=f"{raw_mae*100:.2f} cm")
+        self.i_corr_lbl.config(text=f"{corr_mae*100:.2f} cm")
+        self.i_err_lbl.config(
+            text=f"−{improv:.1f} %" if improv >= 0 else f"+{-improv:.1f} %",
+            foreground=("#00cc88" if improv > 0 else "#ffaa00"))
+        self.i_angle_lbl.config(text=f"n={len(df)}")
+
+        self.infer_status.config(
+            text=(f"Replay {label}: {len(df)} rows  ·  "
+                  f"raw MAE {raw_mae*100:.1f} cm  →  corr MAE {corr_mae*100:.1f} cm  "
+                  f"({improv:+.1f}% improvement)"),
+            foreground="#00cc88" if improv > 0 else "#ffaa00")
+
+        # Repurpose the two existing matplotlib axes for the offline view
+        fig = self._inf_fig
+        ax_left  = self._inf_ax_pos
+        ax_right = self._inf_ax_dist
+        ax_left.clear(); ax_right.clear()
+        for ax in (ax_left, ax_right):
+            ax.set_facecolor("#0d0d0d")
+            for s in ax.spines.values():
+                s.set_color("#888")
+            ax.tick_params(colors="#bbb")
+            ax.title.set_color("#ddd")
+            ax.xaxis.label.set_color("#bbb")
+            ax.yaxis.label.set_color("#bbb")
+
+        ax_left.scatter(y_true, raw,    s=8, alpha=0.45, c="tomato",
+                        label=f"raw   (MAE {raw_mae*100:.1f} cm)")
+        ax_left.scatter(y_true, y_pred, s=8, alpha=0.55, c="#00cc88",
+                        label=f"corr  (MAE {corr_mae*100:.1f} cm)")
+        lo = float(min(y_true.min(), raw.min(), y_pred.min())) - 0.2
+        hi = float(max(y_true.max(), raw.max(), y_pred.max())) + 0.2
+        ax_left.plot([lo, hi], [lo, hi], "--", color="#888", alpha=0.7,
+                     label="y = x (perfect)")
+        ax_left.set_xlabel("true distance (m)")
+        ax_left.set_ylabel("model output (m)")
+        ax_left.set_title(f"Replay: {label}  ·  n={len(df)}")
+        ax_left.legend(fontsize=7, facecolor="#1a1a1a", edgecolor="#444",
+                       labelcolor="#ddd")
+
+        ax_right.hist(raw - y_true, bins=40, color="tomato", alpha=0.55,
+                      label=f"raw   σ={(raw-y_true).std():.2f}")
+        ax_right.hist(y_pred - y_true, bins=40, color="#00cc88", alpha=0.55,
+                      label=f"corr  σ={(y_pred-y_true).std():.2f}")
+        ax_right.axvline(0, color="#bbb", ls="--", alpha=0.5)
+        ax_right.set_xlabel("error (m)")
+        ax_right.set_title("Error distribution")
+        ax_right.legend(fontsize=7, facecolor="#1a1a1a", edgecolor="#444",
+                        labelcolor="#ddd")
+
+        fig.tight_layout()
+        self._inf_canvas.draw_idle()
 
     def _redraw_inference(self, true_d, true_a, corr, angle_est):
         fig     = self._inf_fig
@@ -1248,24 +2164,22 @@ class UWBBLECalApp:
     # ══════════════════════ CLEANUP ════════════════════════════════════════
 
     def on_close(self):
-        self.poller.stop()
+        # Routed through _on_close which already shuts the engine + logger.
         self._collecting   = False
         self._infer_active = False
-        self.root.destroy()
+        self._on_close()
 
 
 # ─── ENTRY POINT ──────────────────────────────────────────────────────────────
 
 def main():
-    if not HAS_REQUESTS:
+    if not HAS_BLEAK:
         print(
-            "Warning: 'requests' library not found.\n"
-            "  Live BLE polling will not work.\n"
-            "  Install with:  pip install requests\n"
+            "Warning: 'bleak' library not found.\n"
+            "  Direct BLE will not work — run:  pip install bleak\n"
         )
     root = tk.Tk()
-    app  = UWBBLECalApp(root)
-    root.protocol("WM_DELETE_WINDOW", app.on_close)
+    UWBBLECalApp(root)
     root.mainloop()
 
 

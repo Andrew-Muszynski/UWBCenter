@@ -341,6 +341,67 @@
           <div class="settings-status" id="device-settings-display"></div>
         </div>
       </div>
+
+      <!-- ── Data Collection Panel ── -->
+      <div id="collection-panel">
+        <div class="section-title" style="margin-top:24px">Data Collection</div>
+        <div class="settings-card" id="collection-card">
+          <div class="setting-row">
+            <label>True Distance (m):</label>
+            <input type="number" id="col-dist" value="1.00" min="0" max="50" step="0.01" style="width:80px">
+          </div>
+          <div class="setting-row">
+            <label>Angle (°):</label>
+            <select id="col-angle" style="background:#21262d;color:#e6edf3;border:1px solid #30363d;border-radius:6px;padding:4px 8px">
+              <option value="0">0</option>
+              <option value="45">45</option>
+              <option value="90">90</option>
+              <option value="135">135</option>
+              <option value="180">180</option>
+              <option value="225">225</option>
+              <option value="270">270</option>
+              <option value="315">315</option>
+            </select>
+          </div>
+          <div class="setting-row">
+            <label>Target Samples:</label>
+            <input type="number" id="col-target" value="500" min="1" max="10000" step="50" style="width:80px">
+          </div>
+          <div class="setting-row">
+            <label>Notes:</label>
+            <input type="text" id="col-notes" placeholder="e.g. LOS, hallway" style="flex:1;background:#21262d;color:#e6edf3;border:1px solid #30363d;border-radius:6px;padding:4px 8px">
+          </div>
+          <div class="setting-row" style="gap:8px">
+            <button class="btn-cmd primary" id="col-start-btn" onclick="startCollection()" style="padding:6px 16px;font-size:0.8rem">▶ Start Collection</button>
+            <button class="btn-cmd" id="col-stop-btn" onclick="stopCollection()" style="padding:6px 16px;font-size:0.8rem" disabled>■ Stop & Save</button>
+          </div>
+
+          <!-- Live stats -->
+          <div id="col-stats" style="margin-top:12px;padding:10px;background:#161b22;border-radius:8px;border:1px solid #30363d;display:none">
+            <div style="display:flex;align-items:center;gap:8px;margin-bottom:8px">
+              <div id="col-active-dot" style="width:8px;height:8px;border-radius:50%;background:#3fb950;box-shadow:0 0 6px #3fb950"></div>
+              <span style="font-size:0.8rem;font-weight:600" id="col-status-text">Collecting…</span>
+            </div>
+            <div style="display:grid;grid-template-columns:1fr 1fr;gap:6px;font-size:0.8rem">
+              <div>Samples: <span id="col-count" style="color:#79c0ff;font-weight:600">0</span> / <span id="col-target-display">500</span></div>
+              <div>True: <span id="col-true-dist" style="color:#f0883e;font-weight:600">—</span> m</div>
+              <div>Mean: <span id="col-mean" style="color:#79c0ff;font-weight:600">—</span> m</div>
+              <div>Std: <span id="col-std" style="color:#79c0ff;font-weight:600">—</span> m</div>
+              <div>Error: <span id="col-error" style="font-weight:600">—</span> m</div>
+              <div>Angle: <span id="col-angle-display" style="color:#8b949e">—</span>°</div>
+            </div>
+            <!-- progress bar -->
+            <div style="margin-top:8px;background:#21262d;border-radius:4px;height:6px;overflow:hidden">
+              <div id="col-progress" style="height:100%;background:#3fb950;width:0%;transition:width 0.3s"></div>
+            </div>
+          </div>
+
+          <!-- Dataset info -->
+          <div id="col-dataset-info" style="margin-top:10px;font-size:0.7rem;color:#8b949e">
+            Dataset: loading…
+          </div>
+        </div>
+      </div>
     </div>
 
     <!-- ── Right: position map ── -->
@@ -1077,6 +1138,129 @@ function updateSettingsDisplay(devices) {
 
 poll();
 setInterval(poll, 1000);
+
+// ── Data Collection ───────────────────────────────────────────
+let colPolling = null;
+
+async function startCollection() {
+  const td = parseFloat(document.getElementById("col-dist").value);
+  const angle = parseFloat(document.getElementById("col-angle").value);
+  const target = parseInt(document.getElementById("col-target").value) || 500;
+  const notes = document.getElementById("col-notes").value;
+
+  if (isNaN(td) || td < 0) {
+    showFeedback("Enter a valid true distance", true);
+    return;
+  }
+
+  try {
+    const resp = await fetch("/api/collection/start", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({true_dist_m: td, angle_deg: angle, target_samples: target, notes: notes})
+    });
+    const data = await resp.json();
+    if (!resp.ok) {
+      showFeedback(data.error || "Failed to start", true);
+      return;
+    }
+
+    document.getElementById("col-start-btn").disabled = true;
+    document.getElementById("col-stop-btn").disabled = false;
+    document.getElementById("col-stats").style.display = "";
+    document.getElementById("col-true-dist").textContent = td.toFixed(2);
+    document.getElementById("col-target-display").textContent = target;
+    document.getElementById("col-angle-display").textContent = angle;
+    document.getElementById("col-status-text").textContent = "Collecting…";
+    document.getElementById("col-active-dot").style.background = "#3fb950";
+    document.getElementById("col-active-dot").style.boxShadow = "0 0 6px #3fb950";
+
+    showFeedback("Collection started: " + td + " m @ " + angle + "°");
+
+    // Poll collection status
+    colPolling = setInterval(pollCollectionStatus, 500);
+  } catch(e) {
+    showFeedback("Network error: " + e.message, true);
+  }
+}
+
+async function stopCollection() {
+  if (colPolling) { clearInterval(colPolling); colPolling = null; }
+
+  try {
+    const resp = await fetch("/api/collection/stop", { method: "POST" });
+    const data = await resp.json();
+
+    document.getElementById("col-start-btn").disabled = false;
+    document.getElementById("col-stop-btn").disabled = true;
+    document.getElementById("col-status-text").textContent = "Stopped — " + (data.saved || 0) + " samples saved";
+    document.getElementById("col-active-dot").style.background = "#8b949e";
+    document.getElementById("col-active-dot").style.boxShadow = "none";
+
+    if (data.stats) {
+      const s = data.stats;
+      showFeedback(
+        `Saved ${s.count} samples. Mean: ${s.mean_dist?.toFixed(3) || '—'} m, ` +
+        `Error: ${s.mean_error?.toFixed(3) || '—'} m, Std: ${s.std_dist?.toFixed(3) || '—'} m`
+      );
+    }
+
+    refreshDatasetInfo();
+  } catch(e) {
+    showFeedback("Network error: " + e.message, true);
+  }
+}
+
+async function pollCollectionStatus() {
+  try {
+    const resp = await fetch("/api/collection/status");
+    const d = await resp.json();
+
+    document.getElementById("col-count").textContent = d.count;
+    if (d.mean_dist != null) document.getElementById("col-mean").textContent = d.mean_dist.toFixed(3);
+    if (d.std_dist != null) document.getElementById("col-std").textContent = d.std_dist.toFixed(3);
+
+    const errEl = document.getElementById("col-error");
+    if (d.mean_error != null) {
+      const err = d.mean_error;
+      errEl.textContent = (err >= 0 ? "+" : "") + err.toFixed(3);
+      errEl.style.color = Math.abs(err) < 0.15 ? "#3fb950" : (Math.abs(err) < 0.30 ? "#f0883e" : "#f85149");
+    }
+
+    const pct = d.target_samples > 0 ? Math.min(100, (d.count / d.target_samples) * 100) : 0;
+    document.getElementById("col-progress").style.width = pct + "%";
+
+    // Auto-stop detected
+    if (!d.active && d.count > 0) {
+      clearInterval(colPolling); colPolling = null;
+      document.getElementById("col-start-btn").disabled = false;
+      document.getElementById("col-stop-btn").disabled = true;
+      document.getElementById("col-status-text").textContent = "Complete — " + d.count + " samples";
+      document.getElementById("col-active-dot").style.background = "#3fb950";
+      document.getElementById("col-active-dot").style.boxShadow = "none";
+      // Auto-save
+      await fetch("/api/collection/stop", { method: "POST" });
+      refreshDatasetInfo();
+    }
+  } catch(e) {}
+}
+
+async function refreshDatasetInfo() {
+  try {
+    const resp = await fetch("/api/collection/dataset_info");
+    const d = await resp.json();
+    const el = document.getElementById("col-dataset-info");
+    if (!d.exists) {
+      el.textContent = "Dataset: empty (no data collected yet)";
+    } else {
+      const dists = d.distances.map(x => x.true_dist_m.toFixed(1) + "m (" + x.count + ")").join(", ");
+      el.textContent = "Dataset: " + d.total_samples + " total samples — " + dists;
+    }
+  } catch(e) {}
+}
+
+// Initial dataset info load
+refreshDatasetInfo();
 </script>
 </body>
 </html>

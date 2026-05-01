@@ -1,0 +1,50 @@
+flowchart TD
+    subgraph TIER1["Tier 1 - Embedded Firmware"]
+        TAG["Tag T1\nArduino Nano 33 BLE\n+ DWM1000 Shield"]
+        ANCHOR["Anchor A1\nArduino Nano 33 BLE\n+ DWM1000 Shield"]
+        TAG -- "POLL [0x01, tag_id]\n(UWB 6.8 Mbps)" --> ANCHOR
+        ANCHOR -- "RESP [0x02, anchor_id, reply_delay]\n(UWB 6.8 Mbps)" --> TAG
+        TAG -. "Computes ToF, distance,\nRX diagnostics, NLOS flag" .-> TAGBLE["BLE Notify\nTagFrame (43 bytes)"]
+        ANCHOR -. "Computes RX diagnostics" .-> ANCBLE["BLE Notify\nAnchorFrame (33 bytes)"]
+    end
+
+    subgraph TIER2["Tier 2 - Edge Gateway (Raspberry Pi 5)"]
+        subgraph DASH["uwb_dashboard.py"]
+            BLE["BLE Layer\n(asyncio + Bleak)\nAuto-scan, reconnect"]
+            DATA["Data Layer\nCSV Logger\nlogs/AD_delay/\nIn-memory deques"]
+            FLASK["Flask API :5050\n/api/state\n/api/command\n/api/collection/*"]
+            WEB["Web Dashboard\ndashboard.html\nReal-time charts"]
+        end
+        BLE --> DATA
+        DATA --> FLASK
+        FLASK --> WEB
+    end
+
+    subgraph TIER3["Tier 3 - ML Clients"]
+        BLECAL["uwb_ble_calibration.py\n(BLE/HTTP Client, Tkinter)\nCollect | Import | Dataset\nTrain | Infer"]
+        SERIALCAL["UWB_calibration_ml.py\n(Serial Client, Tkinter)\nCollect | Dataset\nTrain | Live Correction"]
+        subgraph ML["sklearn ML Pipeline"]
+            FEAT["Feature Engineering\nampl1_ratio, cir_norm\nampl_spread, quality"]
+            MODELS["Model Selection\nPolynomial Regression\nRidge Poly | GBR\nRandom Forest"]
+            EVAL["Evaluation\nMAE, RMSE, R-squared\n5-Fold Cross-Validation"]
+            FEAT --> MODELS --> EVAL
+        end
+        BLECAL --> ML
+        SERIALCAL --> ML
+    end
+
+    TAGBLE -- "BLE Notify" --> BLE
+    ANCBLE -- "BLE Notify" --> BLE
+    FLASK -- "HTTP /api/state\n(polled every 0.5s)" --> BLECAL
+    BLECAL -- "POST /api/command\nPOST /api/set_all_delay" --> FLASK
+    SERIALCAL -. "USB Serial\n(direct to Arduino)" .-> TAG
+
+    classDef tier1 fill:#1a1a2e,stroke:#e94560,color:#eee
+    classDef tier2 fill:#16213e,stroke:#0f3460,color:#eee
+    classDef tier3 fill:#0f3460,stroke:#53a8b6,color:#eee
+    classDef ml fill:#1b2838,stroke:#66c0f4,color:#eee
+
+    class TAG,ANCHOR,TAGBLE,ANCBLE tier1
+    class BLE,DATA,FLASK,WEB tier2
+    class BLECAL,SERIALCAL tier3
+    class FEAT,MODELS,EVAL ml

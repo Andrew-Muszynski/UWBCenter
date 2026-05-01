@@ -1,0 +1,2 @@
+timestamp,device,anchor_id,seq,distance_m,rx_power,fp_power,fp_rx_ratio,quality,round_trip,reply_delay,std_noise,fp_ampl1,fp_ampl2,fp_ampl3,cir_power,rxpacc,flags,anchor_count,nlos_suspect
+2026-04-30T13:02:01.069,T1,1,101,5.244,-66.3,-91.0,-24.7,94.88,427315812,427313576,56,14717,5313,6856,19813,1238,3,1,True

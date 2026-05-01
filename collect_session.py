@@ -39,8 +39,11 @@ API_COL_STOP   = f"{DASHBOARD_BASE}/api/collection/stop"
 API_COL_STATUS = f"{DASHBOARD_BASE}/api/collection/status"
 API_DATASET    = f"{DASHBOARD_BASE}/api/collection/dataset_info"
 
-# Distances to collect (metres).  Edit this list to match your plan.
-DISTANCES = [0.5, 1.0, 2.0, 3.0, 5.0, 7.0, 10.0]
+# Distances to collect.  Option C: whole-foot plan (classroom-feasible).
+# Feet are converted to metres for the dataset (true_dist_m stays metric).
+DISTANCES_FT = [1, 2, 3, 5, 8, 12, 20]
+DISTANCES = [round(ft * 0.3048, 3) for ft in DISTANCES_FT]
+# → [0.305, 0.610, 0.914, 1.524, 2.438, 3.658, 6.096] m
 
 ANGLE_DEG       = 0        # fixed orientation for baseline campaign
 SAMPLES_PER_DIST = 500     # 500 samples ≈ 25 s at 20 Hz
@@ -200,7 +203,7 @@ def main():
     print("=" * 62)
     print("  UWB BASELINE DATA COLLECTION SESSION")
     print("=" * 62)
-    print(f"  Distances : {DISTANCES} m")
+    print(f"  Distances : {DISTANCES_FT} ft  →  {DISTANCES} m")
     print(f"  Angle     : {ANGLE_DEG}°  (fixed)")
     print(f"  Samples   : {SAMPLES_PER_DIST} per distance")
     print(f"  Est. time : ~{len(DISTANCES) * 1.5:.0f} min  (25s collect + setup each)")
@@ -225,10 +228,10 @@ def main():
     print()
 
     results = []
-    for i, dist in enumerate(DISTANCES):
-        print(f"─── Distance {i+1}/{len(DISTANCES)}: {dist} m ───")
-        print(f"  ACTION: Place tag at exactly {dist} m from anchor (laser measure).")
-        input(f"  Press ENTER when tag is positioned at {dist} m … ")
+    for i, (dist, ft) in enumerate(zip(DISTANCES, DISTANCES_FT)):
+        print(f"─── Distance {i+1}/{len(DISTANCES)}: {ft} ft  ({dist} m) ───")
+        print(f"  ACTION: Place tag at exactly {ft} ft ({dist} m) from anchor.")
+        input(f"  Press ENTER when tag is positioned at {ft} ft … ")
 
         stats = collect_one_distance(dist, ANGLE_DEG, SAMPLES_PER_DIST)
         results.append(stats)
