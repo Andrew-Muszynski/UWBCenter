@@ -33,7 +33,7 @@ This system corrects systematic ranging errors in DWM1000 Ultra-Wideband (UWB) h
                │                                               │
                ▼                                               ▼
 ┌─────────────────────────────────────────────────────────────────────────┐
-│                     TIER 2 — EDGE GATEWAY (Raspberry Pi 5)              │
+│                     TIER 2 — EDGE GATEWAY (Mac OS running)              │
 │                                                                         │
 │   ┌───────────────────────────────────────────────────────────────────┐ │
 │   │                     uwb_dashboard.py                              │ │
